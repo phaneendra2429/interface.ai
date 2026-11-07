@@ -1,0 +1,2 @@
+# Requirements
+# Runs on Python 3.9+ standard library with zero external dependencies.
