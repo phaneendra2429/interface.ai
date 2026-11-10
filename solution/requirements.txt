@@ -1,0 +1,2 @@
+# Solution Requirements
+# The solution is designed to run purely on standard Python 3.9+ libraries with zero external dependencies.
