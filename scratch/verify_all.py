@@ -310,7 +310,8 @@ def test_judge_reproductions():
     a_cap = ks_mort.answer("What is the interest rate for a $600,000 mortgage?")
     print(f"Single-row $600k ceiling refusal: confident={a_cap.confident}, text={a_cap.text}")
     assert not a_cap.confident, "Expected refusal for $600,000 above $550,000 ceiling"
-    assert "$550,000" in a_cap.text and "$832,750" not in a_cap.text, f"Expected $550,000 dynamic ceiling, got {a_cap.text}"
+    assert "$550,000" not in a_cap.text, f"The refusal must not introduce the ceiling: {a_cap.text}"
+    assert any("$550,000" in source.quote for source in a_cap.sources), "The refusal must cite the actual ceiling"
 
     # 2. Qualifier strictness: $150k shorthand, 2099 model year, 15-month CD, regular-only / dividend-rate CD
     p_certs = Page(

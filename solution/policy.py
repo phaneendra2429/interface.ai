@@ -6,7 +6,7 @@ Adheres strictly to ARCHITECTURE_AND_DESIGN.md v5.0.
 from __future__ import annotations
 
 import sys
-from collections import Counter
+from collections import defaultdict
 from pathlib import Path
 from typing import Optional
 
@@ -18,8 +18,10 @@ if "contract" not in sys.modules:
 
 try:
     from models import ExtractedFact
+    from sanitizer import clean_url_path
 except ImportError:
     from solution.models import ExtractedFact
+    from solution.sanitizer import clean_url_path
 
 
 class EligibilityEngine:
@@ -32,7 +34,7 @@ class EligibilityEngine:
         2. Offer expiry: if explicitly expired before target_date, strictly ineligible as active.
         3. Offer effective date: if effective_date is in the future relative to target_date, ineligible.
         """
-        if fact.taken_on > cutoff_date:
+        if fact.taken_on > min(target_date, cutoff_date):
             return False
         if fact.expiry_date and fact.expiry_date < target_date:
             return False
@@ -58,19 +60,40 @@ class EligibilityEngine:
         active_snapshot_id: Optional[str] = None,
     ) -> Optional[ExtractedFact]:
         """Select the authoritative winning fact according to unified eligibility and ranking rules.
-        When active_snapshot_id is provided, facts present in the active snapshot supersede
-        facts from pages removed in earlier snapshots.
+        For current values, the active snapshot is the only eligible crawl.
         """
         eligible = [f for f in facts if cls.is_eligible(f, target_date, cutoff_date)]
         if not eligible:
             return None
         if active_snapshot_id is not None:
-            active_eligible = [f for f in eligible if f.snapshot_id == active_snapshot_id]
-            if active_eligible:
-                eligible = active_eligible
-        val_counts = Counter((f.authority_score, f.value_str) for f in eligible)
-        eligible.sort(
-            key=lambda f: (cls.rank_key(f), val_counts[(f.authority_score, f.value_str)]),
-            reverse=True,
-        )
-        return eligible[0]
+            eligible = [f for f in eligible if f.snapshot_id == active_snapshot_id]
+        return cls.choose(eligible)
+
+    @classmethod
+    def choose(cls, facts: list[ExtractedFact]) -> Optional[ExtractedFact]:
+        """Choose from a qualified, eligible set. A genuine tie has no winner."""
+        if not facts:
+            return None
+        superseding = [f for f in facts if f.supersedes]
+        if superseding:
+            facts = superseding
+        strongest_rank = max(map(cls.rank_key, facts))
+        by_value = defaultdict(list)
+        for fact in facts:
+            if cls.rank_key(fact) != strongest_rank:
+                continue
+            value = fact.typed_value
+            key = (
+                value.unit, value.is_range, round(value.low, 8),
+                None if value.high is None else round(value.high, 8),
+            ) if value is not None else (fact.unit, fact.value_str)
+            by_value[key].append(fact)
+        by_support = defaultdict(list)
+        for group in by_value.values():
+            support = len({clean_url_path(f.source_url) for f in group})
+            by_support[support].append(group)
+        strongest = by_support[max(by_support)]
+        if len(strongest) != 1:
+            return None
+        winner = min(strongest[0], key=lambda f: (f.source_url, f.raw_quote, f.value_str))
+        return None if winner.withdrawn else winner

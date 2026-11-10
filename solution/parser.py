@@ -221,7 +221,9 @@ def parse_markdown_tables(page_raw_md: str, url: str, snapshot_id: str, taken_on
                 account_category = "personal"
                 headers_str = " ".join(headers).lower()
 
-                if "auto" in imm_heading or "motorcycle" in imm_heading or "auto" in headers_str:
+                if re.search(r"\b(?:atv|snowmobile|jet ski|boat|rv|recreational)\b", imm_heading):
+                    entity_hint = "recreational_loan"
+                elif "auto" in imm_heading or "motorcycle" in imm_heading or "auto" in headers_str:
                     entity_hint = "auto_loan"
                 elif "heloc" in imm_heading or "home equity line" in imm_heading or "heloc" in headers_str:
                     entity_hint = "heloc"
@@ -298,19 +300,23 @@ def parse_markdown_tables(page_raw_md: str, url: str, snapshot_id: str, taken_on
 
 def _classify_fee_label(label_l: str) -> tuple[str, str, str]:
     """Return (entity, product_name, attribute) for a fee description label."""
+    card = "platinum" if "platinum" in label_l else "rewards" if "rewards" in label_l else ""
+    product = (f"business_{card}" if "business" in label_l else f"{card}_visa") if card else ""
     if "foreign transaction" in label_l:
-        return ("credit_card", "", "foreign_transaction_fee")
+        return ("credit_card", product, "foreign_transaction_fee")
     if "cash advance" in label_l:
-        return ("credit_card", "", "cash_advance_fee")
+        return ("credit_card", product, "cash_advance_fee")
     if "balance transfer" in label_l:
-        return ("credit_card", "", "balance_transfer_fee")
+        return ("credit_card", product, "balance_transfer_fee")
     if "annual fee" in label_l:
-        return ("credit_card", "", "annual_fee")
+        return ("credit_card", product, "annual_fee")
     if "late payment" in label_l or "late fee" in label_l:
         return ("credit_card" if ("card" in label_l or "visa" in label_l) else "fee", "late_fee", "late_fee")
     if "overdraft" in label_l or "courtesy pay" in label_l or "paid items" in label_l or "nsf" in label_l:
         return ("overdraft", "overdraft", "overdraft_fee")
     if "replacement" in label_l:
+        if product or "credit card" in label_l:
+            return ("credit_card", product, "replacement_fee")
         return ("debit_card", "debit_card", "replacement_fee")
     if "statement" in label_l:
         return ("paper_statement", "paper_statement", "monthly_fee")
@@ -334,6 +340,7 @@ def _parse_table_rows(
     footnotes: dict[str, str],
 ) -> list[ExtractedFact]:
     facts: list[ExtractedFact] = []
+    has_ira_column = any(re.search(r"\bira\b", h, re.I) for h in headers)
     
     col_types: list[str] = []
     for h in headers:
@@ -348,10 +355,10 @@ def _parse_table_rows(
             col_types.append("interest_rate")
         elif "term" in hl:
             col_types.append("term")
+        elif re.search(r"\bmin(?:imum)?\b", hl):
+            col_types.append("minimum")
         elif "balance" in hl or "program" in hl or "certificate" in hl or "loan program" in hl or "card" in hl:
             col_types.append("product_or_tier")
-        elif "min" in hl:
-            col_types.append("minimum")
         elif "fee" in hl and ("amount" in hl or hl == "fee" or hl == "fees"):
             col_types.append("fee_val")
         else:
@@ -387,7 +394,9 @@ def _parse_table_rows(
     prev_row_entity: Optional[str] = None
     prev_row_product: str = ""
 
+    table_category = account_category
     for raw_line, cols in rows:
+        account_category = table_category
         row_text = " ".join(cols)
         row_text_clean = clean_markdown_text(row_text)
         row_text_l = row_text_clean.lower()
@@ -475,7 +484,11 @@ def _parse_table_rows(
         entity = entity_hint
         product_name = ""
 
-        if "heloc" in row_text_l or "home equity line" in row_text_l or "heloc" in imm_heading:
+        if entity_hint == "recreational_loan":
+            product_name = "recreational_loan"
+        elif "home-equity" in url.lower() and re.match(r"loan\s*[-–—]", row_text_l):
+            entity = product_name = "home_equity_loan"
+        elif "heloc" in row_text_l or "home equity line" in row_text_l or "heloc" in imm_heading:
             entity = "heloc"
             product_name = "heloc"
         elif "home equity loan" in row_text_l or "home equity loan" in imm_heading or entity == "home_equity_loan":
@@ -488,9 +501,14 @@ def _parse_table_rows(
             entity = "health_savings"
             product_name = "health_savings"
             account_category = "health_savings"
-        elif "certificate" in row_text_l or "certificate" in imm_heading or entity == "certificate" or any("certificate" in h.lower() for h in headers):
+        elif ("certificate" in row_text_l or "certificate" in imm_heading or entity == "certificate"
+              or any("certificate" in h.lower() for h in headers)
+              or (has_ira_column and term_months is not None)):
             entity = "certificate"
             product_name = "certificate_special" if is_special else "certificate_regular"
+            ira_subtype = re.search(r"\b(traditional|roth)(?=\s*:|\s+ira\b)", row_text_l + " " + imm_heading)
+            if ira_subtype:
+                account_category = f"{ira_subtype[1]}_ira"
         elif "1st rate checking" in row_text_l or "1st rate checking" in imm_heading or "1st rate" in row_text_l:
             entity = "checking"
             product_name = "business_1st_rate_checking" if account_category == "business" else "1st_rate_checking"
@@ -581,7 +599,9 @@ def _parse_table_rows(
         # Check for attached footnote markers
         footnote_text = None
         for fn_k, fn_v in footnotes.items():
-            if fn_k in row_text:
+            if re.search(rf"(?:%|APR|APY)\s*{re.escape(fn_k)}\s*(?:$|\*)", row_text, re.I) or any(
+                re.search(rf"(?:%|APR|APY)\s*{re.escape(fn_k)}\s*(?:$|\*)", cell, re.I) for cell in cols
+            ):
                 footnote_text = fn_v
                 break
 
@@ -612,6 +632,7 @@ def _parse_table_rows(
                     effective_date=effective_date,
                     expiry_date=expiry_date,
                     footnote_text=footnote_text,
+                    footnote_conditions=fee_val_raw,
                     typed_value=TypedValue(is_range=False, low=d_num, high=None, unit="$", raw_str=d_str),
                     raw_quote=raw_line.strip(),
                 ))
@@ -635,6 +656,7 @@ def _parse_table_rows(
                     effective_date=effective_date,
                     expiry_date=expiry_date,
                     footnote_text=footnote_text,
+                    footnote_conditions=fee_val_raw,
                     typed_value=TypedValue(is_range=False, low=p_num, high=None, unit="%", raw_str=p_str),
                     raw_quote=raw_line.strip(),
                 ))
@@ -656,6 +678,7 @@ def _parse_table_rows(
                     effective_date=effective_date,
                     expiry_date=expiry_date,
                     footnote_text=footnote_text,
+                    footnote_conditions=fee_val_raw,
                     typed_value=TypedValue(is_range=False, low=0.0, high=None, unit="$", raw_str="$0.00"),
                     raw_quote=raw_line.strip(),
                 ))
@@ -1042,12 +1065,14 @@ def parse_prose_facts(page_raw_md: str, url: str, snapshot_id: str, taken_on: st
     lines = page_raw_md.splitlines()
 
     vto_emp_re = re.compile(r"(\d{2,4})\s+(?:Dupaco\s+)?employees\s*\*{0,2}\s+used\b", re.I)
-    vto_hours_re = re.compile(r"(\d{1,2}(?:,\d{3})*|\d{3,5})\s+(?:hours|volunteer hours)\b", re.I)
+    vto_hours_re = re.compile(r"(?<![\d,.])(\d{1,3}(?:,\d{3})+|\d+)\s+(?:(?:volunteer|VTO)\s+)?hours\b", re.I)
     vto_boards_re = re.compile(r"(\d{2,4})\s+(?:community\s+)?boards\b", re.I)
-    year_re = re.compile(r"\b(202[0-9])\b")
+    year_re = re.compile(r"\b((?:19|20)\d{2})\b")
     branch_count_re = re.compile(r"\b(\d{1,3})\s+(?:branches|branch locations)\b", re.I)
-    routing_re = re.compile(r"\b(?:routing\s+number|aba\s+number|aba\s+routing\s+number|routing\s+&\s+transit\s+number)[\s:]*\(?(\d{9})\)?\b", re.I)
-    raw_routing_re = re.compile(r"\b(2739\d{5})\b")
+    routing_re = re.compile(
+        r"\b(?:aba\s+(?:routing\s+)?number|routing\s+(?:(?:and|&)\s+transit\s+)?number)"
+        r"\s*[:=]?\s*(?:is\s+)?\(?(\d{9})\b", re.I,
+    )
 
     foreign_tx_re = re.compile(r"foreign\s+transaction\s+fee\s*[—–\-:]+\s*(\d+(?:\.\d+)?)\s*%", re.I)
     cash_adv_re = re.compile(r"cash\s+advance\s+fee\s*[—–\-:]+\s*\$\s*(\d+(?:\.\d+)?)(?:\s+or\s+(\d+(?:\.\d+)?)\s*%)?", re.I)
@@ -1056,11 +1081,50 @@ def parse_prose_facts(page_raw_md: str, url: str, snapshot_id: str, taken_on: st
 
     account_category = "business" if "business" in url.lower() else "personal"
 
+    last_volunteer_year = None
     for line in lines:
         line_s = line.strip()
         if not line_s:
             continue
         line_l = line_s.lower()
+
+        retired_certificate = (
+            re.search(r"\b(?:certificates?|cds?)\b[^.]*\b(?:has been|have been|is|are|was|were)\s+"
+                      r"(?:discontinued|retired|withdrawn|no longer offered)\b", line_l)
+            and MONTH_TERM_RE.search(line_s)
+        )
+        if retired_certificate:
+            ira = re.search(r"\b(traditional|roth)\b", line_l)
+            category = f"{ira[1]}_ira" if ira else ("ira" if re.search(r"\bira\b", line_l) else account_category)
+            facts.append(ExtractedFact(
+                identity=FactIdentity(entity="certificate", term_months=int(retired_certificate[1]),
+                                      account_category=category, is_jumbo="jumbo" in line_l,
+                                      is_special="special" in line_l),
+                value_str="unpublished", value_num=None, unit="", source_url=url,
+                snapshot_id=snapshot_id, taken_on=taken_on, authority_score=authority,
+                effective_date=extract_effective_date(line_s), raw_quote=line_s,
+                supersedes=True, withdrawn=True,
+            ))
+
+        if re.search(r"(?:lost\s+)?debit card replacement", line_l):
+            free = re.search(r"\b(?:free|no (?:charge|fee)|waived)\b", line_l)
+            retired = re.search(r"\b(?:retired|discontinued|removed|eliminated)\b", line_l)
+            if free or retired:
+                facts.append(ExtractedFact(
+                    identity=FactIdentity(entity="debit_card", product_name="debit_card", attribute="replacement_fee"),
+                    value_str="free" if free else "unpublished",
+                    value_num=0.0 if free else None,
+                    unit="$" if free else "",
+                    source_url=url,
+                    snapshot_id=snapshot_id,
+                    taken_on=taken_on,
+                    authority_score=authority,
+                    effective_date=extract_effective_date(line_s),
+                    typed_value=TypedValue(is_range=False, low=0.0, high=None, unit="$", raw_str="free") if free else None,
+                    raw_quote=line_s,
+                    supersedes=bool(retired or re.search(r"\bnow\b", line_l)),
+                    withdrawn=not bool(free),
+                ))
 
         # Fine-print fee disclosures (e.g., on credit card and rate pages)
         m_ftx = foreign_tx_re.search(line_s)
@@ -1070,6 +1134,12 @@ def parse_prose_facts(page_raw_md: str, url: str, snapshot_id: str, taken_on: st
             facts.append(ExtractedFact(
                 identity=FactIdentity(
                     entity="credit_card",
+                    product_name=(
+                        ("business_platinum" if account_category == "business" else "platinum_visa")
+                        if "platinum visa" in line_l else
+                        ("business_rewards" if account_category == "business" else "rewards_visa")
+                        if "rewards visa" in line_l else ""
+                    ),
                     attribute="foreign_transaction_fee",
                     account_category=account_category,
                 ),
@@ -1151,9 +1221,8 @@ def parse_prose_facts(page_raw_md: str, url: str, snapshot_id: str, taken_on: st
             ))
 
         # Routing number (require explicit routing/ABA context and reject tracking/order numbers)
-        has_routing_kw = "routing" in line_l or "aba" in line_l or "transit" in line_l
         has_non_routing_kw = "tracking" in line_l or "order" in line_l or "invoice" in line_l
-        m_rt = routing_re.search(line_s) or (raw_routing_re.search(line_s) if (has_routing_kw and not has_non_routing_kw) else None)
+        m_rt = routing_re.search(clean_markdown_text(line_s)) if not has_non_routing_kw and "number" in line_l else None
         if m_rt and not has_non_routing_kw:
             r_num = m_rt.group(1)
             rt_auth = max(authority, 0.96) if "/business/cash-management" in url.lower() else authority
@@ -1174,12 +1243,14 @@ def parse_prose_facts(page_raw_md: str, url: str, snapshot_id: str, taken_on: st
             ))
 
         # VTO facts
-        if ("volunteer" in line_l or "vto" in line_l or "giving back" in line_l) and "used" in line_l:
+        if re.search(r"\b(?:volunteer\w*|vto|giving back)\b", line_l):
             years = year_re.findall(line_s)
-            reporting_year = years[0] if years else None
+            reporting_year = years[0] if years else last_volunteer_year
+            if years:
+                last_volunteer_year = years[0]
             
             m_emp = vto_emp_re.search(line_s)
-            if m_emp and reporting_year:
+            if m_emp and reporting_year and re.search(r"volunteer time off|\bvto\b", line_l):
                 emp_count = int(m_emp.group(1))
                 facts.append(ExtractedFact(
                     identity=FactIdentity(
@@ -1199,13 +1270,14 @@ def parse_prose_facts(page_raw_md: str, url: str, snapshot_id: str, taken_on: st
                 ))
 
             m_hrs = vto_hours_re.search(line_s)
-            if m_hrs and reporting_year:
+            if m_hrs and reporting_year and not re.search(r"(?:over|nearly|about|roughly)\s+$", line_s[:m_hrs.start()], re.I):
+                hours_attribute = "vto_hours" if "vto hours" in line_l else "volunteer_hours"
                 hrs_str = m_hrs.group(1).replace(",", "")
                 hrs_count = int(hrs_str)
                 facts.append(ExtractedFact(
                     identity=FactIdentity(
                         entity="dupaco",
-                        attribute="vto_hours",
+                        attribute=hours_attribute,
                         reporting_period=reporting_year,
                     ),
                     value_str=f"{hrs_count:,}",
@@ -1262,7 +1334,8 @@ def parse_prose_facts(page_raw_md: str, url: str, snapshot_id: str, taken_on: st
             ))
         elif m_br and ("dupaco" in line_l or "credit union" in line_l or "/about" in url):
             b_count = int(m_br.group(1))
-            br_auth = 0.60 if "in 2012" in line_l or "joined dupaco in" in line_l else authority
+            historical = re.search(r"\bin\s+(?:19|20)\d{2}\b", line_l)
+            br_auth = min(authority, 0.60) if historical else authority
             facts.append(ExtractedFact(
                 identity=FactIdentity(
                     entity="dupaco",

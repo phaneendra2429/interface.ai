@@ -156,6 +156,8 @@ class ExtractedFact:
     footnote_text: Optional[str] = None
     typed_value: Optional[TypedValue] = None
     raw_quote: str = ""         # exact verbatim substring from page.markdown for Source.quote
+    supersedes: bool = False
+    withdrawn: bool = False
 
 
 @dataclass

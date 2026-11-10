@@ -137,6 +137,8 @@ class ConflictEngine:
                 typed_groups: list[tuple[TypedValue, list[ExtractedFact]]] = []
 
                 for f in bucket:
+                    if f.withdrawn:
+                        continue
                     tv = f.typed_value
                     if tv is None:
                         is_r = "-" in f.value_str or "–" in f.value_str
@@ -190,7 +192,7 @@ class ConflictEngine:
 
                 if winning_fact is None:
                     resolution = None
-                    reason = "All competing offers are expired promotional offers."
+                    reason = "The active snapshot has no eligible, unambiguous winner."
                 else:
                     resolution = winning_fact.value_str
                     if winning_fact.authority_score >= 0.9:

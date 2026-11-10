@@ -6,7 +6,7 @@ Adheres strictly to ARCHITECTURE_AND_DESIGN.md v5.0.
 from __future__ import annotations
 
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Optional, Any
 
@@ -59,11 +59,27 @@ class TemporalLedger:
 
         snap_rec = SnapshotRecord(snapshot_id=sid, taken_on=taken_on)
 
-        for p in snapshot.pages:
+        for p in sorted(snapshot.pages, key=lambda page: (page.url, page.fetched_at, page.title, page.markdown)):
             page_rec, facts, sections = parse_page(p, snapshot_id=sid, taken_on=taken_on)
             snap_rec.pages[p.url] = page_rec
             snap_rec.facts.extend(facts)
             snap_rec.sections.extend(sections)
+
+        # Apply scoped notices to every matching row, including stale rows left in the crawl.
+        notices = [f for f in snap_rec.facts if f.withdrawn and not f.identity.attribute]
+        if notices:
+            identities = dict.fromkeys(f.identity for f in snap_rec.facts if f.identity.attribute)
+            snap_rec.facts = [f for f in snap_rec.facts if f not in notices]
+            for notice in notices:
+                scope = notice.identity
+                categories = {scope.account_category}
+                if scope.account_category == "ira":
+                    categories.update(("traditional_ira", "roth_ira"))
+                snap_rec.facts.extend(replace(notice, identity=identity) for identity in identities
+                                      if identity.entity == scope.entity and identity.term_months == scope.term_months
+                                      and identity.account_category in categories
+                                      and (not scope.is_jumbo or identity.is_jumbo)
+                                      and (not scope.is_special or identity.is_special))
 
         self.snapshots[sid] = snap_rec
         self.chronological_snapshots.append(snap_rec)

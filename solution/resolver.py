@@ -9,6 +9,7 @@ import calendar
 import re
 import sys
 from collections import defaultdict
+from datetime import date
 from pathlib import Path
 from typing import Optional, Any
 
@@ -42,13 +43,11 @@ MONTH_NAMES = {
 
 MONTH_PATTERN_STR = "|".join(sorted(MONTH_NAMES.keys(), key=len, reverse=True))
 
-NUMBER_WORDS = {
-    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7,
-    "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12, "fifteen": 15,
-    "seventeen": 17, "eighteen": 18, "twenty": 20, "twenty-four": 24, "twenty four": 24,
-    "thirty": 30, "thirty-six": 36, "thirty six": 36, "forty-eight": 48, "forty eight": 48,
-    "sixty": 60, "seventy-two": 72, "seventy two": 72, "eighty-four": 84, "eighty four": 84,
-}
+NUMBER_WORDS = dict(zip(
+    "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen".split(),
+    range(1, 20),
+))
+TENS_WORDS = dict(zip("twenty thirty forty fifty sixty seventy eighty ninety".split(), range(20, 100, 10)))
 
 KNOWN_BRANCH_CITIES = (
     "galena", "cedar falls", "waterloo", "dubuque", "platteville", "peosta",
@@ -58,42 +57,27 @@ KNOWN_BRANCH_CITIES = (
 )
 
 
-def _resolve_raw_date_token(raw: str, cutoff_date: Optional[str] = None, default_year: int = 2026) -> Optional[str]:
-    """Convert a matched date string ('2026-05-12', 'May 12, 2026', 'May 2026', 'May') into YYYY-MM-DD."""
-    raw = raw.strip().rstrip(".,;?")
-    if re.match(r"^\d{4}-\d{2}-\d{2}$", raw):
-        return raw
+def _resolve_raw_date_token(
+    raw: str, cutoff_date: Optional[str], shared_year: Optional[int]
+) -> Optional[str]:
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
+        return date.fromisoformat(raw).isoformat()
+    if "/" in raw:
+        month, day, year = map(int, raw.split("/"))
+        return date(year, month, day).isoformat()
 
-    parts = [p for p in re.split(r"[\s,]+", raw) if p]
-    if len(parts) == 3:
-        m_str, d_str, y_str = parts[0].lower(), parts[1], parts[2]
-        if m_str in MONTH_NAMES and d_str.isdigit() and y_str.isdigit():
-            return f"{int(y_str):04d}-{MONTH_NAMES[m_str]:02d}-{int(d_str):02d}"
-    elif len(parts) == 2:
-        m_str, second = parts[0].lower(), parts[1]
-        if m_str in MONTH_NAMES and second.isdigit():
-            m_num = MONTH_NAMES[m_str]
-            val = int(second)
-            if val > 31:
-                y_num = val
-                last_day = calendar.monthrange(y_num, m_num)[1]
-                iso = f"{y_num:04d}-{m_num:02d}-{last_day:02d}"
-                if cutoff_date and cutoff_date.startswith(f"{y_num:04d}-{m_num:02d}-") and cutoff_date < iso:
-                    return cutoff_date
-                return iso
-            else:
-                return f"{default_year:04d}-{m_num:02d}-{val:02d}"
-    elif len(parts) == 1:
-        m_str = parts[0].lower()
-        if m_str in MONTH_NAMES:
-            m_num = MONTH_NAMES[m_str]
-            y_num = int(cutoff_date[:4]) if (cutoff_date and len(cutoff_date) >= 4 and cutoff_date[:4].isdigit()) else default_year
-            last_day = calendar.monthrange(y_num, m_num)[1]
-            iso = f"{y_num:04d}-{m_num:02d}-{last_day:02d}"
-            if cutoff_date and cutoff_date.startswith(f"{y_num:04d}-{m_num:02d}-") and cutoff_date < iso:
-                return cutoff_date
-            return iso
-    return None
+    parts = re.split(r"[\s,]+", raw)
+    month = MONTH_NAMES[parts[0].lower()]
+    year = int(parts[-1]) if len(parts[-1]) == 4 and parts[-1].isdigit() else shared_year
+    if year is None:
+        return None
+    has_day = len(parts) >= 2 and len(parts[1]) < 4
+    if has_day:
+        return date(year, month, int(parts[1])).isoformat()
+    month_end = date(year, month, calendar.monthrange(year, month)[1]).isoformat()
+    if cutoff_date and cutoff_date[:7] == month_end[:7]:
+        return min(cutoff_date, month_end)
+    return month_end
 
 
 FULL_MONTH_NAMES = (
@@ -104,53 +88,30 @@ FULL_MONTH_NAMES = (
 
 def extract_all_date_expressions(text: str, cutoff_date: Optional[str] = None) -> list[tuple[str, str]]:
     """Extract all date expressions in order of appearance as (raw_label, iso_date)."""
-    results: list[tuple[str, str]] = []
-    seen_spans: list[tuple[int, int]] = []
-
-    # 1. Explicit ISO dates YYYY-MM-DD
-    for m in re.finditer(r"\b(\d{4}-\d{2}-\d{2})\b", text):
-        iso = m.group(1)
-        results.append((iso, iso))
-        seen_spans.append((m.start(), m.end()))
-
-    # 2. Month Name [+ Day] [+ Year]
-    month_re = re.compile(
-        rf"\b((?:{MONTH_PATTERN_STR})(?:\s+\d{{1,2}})?(?:,?\s*\d{{4}})?)\b",
+    pattern = re.compile(
+        rf"\b(?:\d{{4}}-\d{{2}}-\d{{2}}|\d{{1,2}}/\d{{1,2}}/\d{{4}}|"
+        rf"(?:{MONTH_PATTERN_STR})(?:\s+\d{{1,2}})?(?:,?\s*\d{{4}})?)\b",
         re.I,
     )
-    for m in month_re.finditer(text):
-        s, e = m.start(), m.end()
-        if any(not (e <= s0 or s >= e0) for s0, e0 in seen_spans):
-            continue
-        raw = m.group(1).strip()
-        parts = [p for p in re.split(r"[\s,]+", raw) if p]
-        first_tok = parts[0].lower()
-
-        # If a single month word without day/year (e.g. "May", "apr"):
-        # - Never match 3-letter abbreviations without a day/year (prevents "APR" matching April!)
-        # - Require a preceding temporal preposition ("in May", "versus September", "as of June")
-        if len(parts) == 1:
-            if first_tok not in FULL_MONTH_NAMES:
+    labels = []
+    for match in pattern.finditer(text):
+        label = match.group()
+        if label.lower() in MONTH_NAMES:
+            if label.lower() not in FULL_MONTH_NAMES:
                 continue
-            prefix = text[max(0, s - 25):s].lower()
-            is_temporal_ctx = bool(
-                re.search(r"\b(?:in|of|on|from|since|by|for|during|between|versus|vs\.?|compared\s+to|and)\s+$", prefix)
-            )
-            if not is_temporal_ctx:
+            prefix = text[:match.start()]
+            if not re.search(r"\b(?:in|of|on|from|since|by|for|during|between|versus|vs\.?|compared\s+to|and)\s+$", prefix, re.I):
                 continue
-
-        iso = _resolve_raw_date_token(raw, cutoff_date=cutoff_date)
-        if iso:
-            results.append((raw, iso))
-            seen_spans.append((s, e))
-
-    # Sort by position in text
-    results_with_pos = []
-    for raw, iso in results:
-        pos = text.find(raw)
-        results_with_pos.append((pos, raw, iso))
-    results_with_pos.sort(key=lambda x: x[0])
-    return [(raw, iso) for _, raw, iso in results_with_pos]
+        labels.append(label)
+    explicit_years = {
+        int(y.group()) for label in labels
+        if (y := re.search(r"\b\d{4}\b", label))
+    }
+    shared_year = next(iter(explicit_years)) if len(explicit_years) == 1 else (
+        int(cutoff_date[:4]) if cutoff_date else None
+    )
+    return [(label, iso) for label in labels
+            if (iso := _resolve_raw_date_token(label, cutoff_date, shared_year))]
 
 
 def parse_date_expression(text: str, cutoff_date: Optional[str] = None) -> Optional[str]:
@@ -161,27 +122,22 @@ def parse_date_expression(text: str, cutoff_date: Optional[str] = None) -> Optio
 
 def extract_requested_term_months(q_lower: str) -> Optional[int]:
     """Extract any requested term in months (supporting integer or word months/years)."""
-    # 1. Explicit integer months: "30-month", "17 month", "6mo"
-    m_mo = re.search(r"\b(\d{1,3})\s*[-–—]?\s*(?:months?|mo)\b", q_lower)
-    if m_mo:
-        return int(m_mo.group(1))
-
-    # 2. Word months: "six-month", "seventeen month", etc.
-    for word, val in sorted(NUMBER_WORDS.items(), key=lambda x: len(x[0]), reverse=True):
-        if re.search(rf"\b{re.escape(word)}\s*[-–—]?\s*months?\b", q_lower):
-            return val
-
-    # 3. Explicit integer years: "15-year", "30 year", "5-yr"
-    m_yr = re.search(r"\b(\d{1,2})\s*[-–—]?\s*(?:years?|yr)\b", q_lower)
-    if m_yr:
-        return int(m_yr.group(1)) * 12
-
-    # 4. Word years: "five-year", "fifteen year", "thirty-year"
-    for word, val in sorted(NUMBER_WORDS.items(), key=lambda x: len(x[0]), reverse=True):
-        if re.search(rf"\b{re.escape(word)}\s*[-–—]?\s*years?\b", q_lower):
-            return val * 12
-
-    return None
+    match = re.search(r"(?<![\w-])(\d+)\s*[-–—]?\s*(months?|mo|years?|yr)\b", q_lower)
+    if match:
+        return int(match[1]) * (12 if match[2].startswith("y") else 1)
+    units = "|".join(NUMBER_WORDS)
+    tens = "|".join(TENS_WORDS)
+    match = re.search(
+        rf"(?<![\w-])((?:{tens})(?:[- ](?:{units}))?|(?:{units}))[-–— ]+(months?|years?)\b",
+        q_lower,
+    )
+    if not match:
+        return None
+    words = re.split(r"[- ]", match[1])
+    number = TENS_WORDS[words[0]] if words[0] in TENS_WORDS else NUMBER_WORDS[words[0]]
+    if len(words) == 2:
+        number += NUMBER_WORDS[words[1]]
+    return number * (12 if match[2].startswith("y") else 1)
 
 
 def extract_requested_amount(q_lower: str) -> Optional[float]:
@@ -262,8 +218,14 @@ class AnswerResolver:
         self.ledger = ledger
 
     def resolve(self, question: str, as_of: Optional[str] = None) -> Answer:
+        return self._resolve_at(question, as_of)
+
+    def _resolve_at(
+        self, question: str, as_of: Optional[str], requested_date: Optional[str] = None,
+        date_exprs: Optional[list[tuple[str, str]]] = None,
+    ) -> Answer:
         q_raw = question
-        q_lower = question.lower()
+        q_lower = question.lower().replace("home-equity", "home equity").replace("balance-transfer", "balance transfer")
 
         # Clock 1: Cutoff Date
         cutoff_date = as_of if as_of is not None else self.ledger.latest_date
@@ -276,30 +238,31 @@ class AnswerResolver:
                 confident=False,
             )
 
-        # Clock 2: Extract all date expressions from question
-        date_exprs = extract_all_date_expressions(question, cutoff_date=cutoff_date)
+        if date_exprs is None:
+            try:
+                date_exprs = extract_all_date_expressions(question, cutoff_date=cutoff_date)
+            except ValueError:
+                return Answer(text="Please provide a valid calendar date.", confident=False)
+            if len(date_exprs) >= 2:
+                return self._check_date_comparison(question, date_exprs, cutoff_date)
+            requested_date = date_exprs[0][1] if date_exprs else None
 
-        # Comparative two-date queries (e.g., May vs September, or comparing two explicit dates)
-        is_comparison_query = len(date_exprs) >= 2 and (
-            any(w in q_lower for w in ("versus", "vs", "compared", "compare", "change", "difference", "between"))
-            or date_exprs[0][1][:7] != date_exprs[1][1][:7]
-        )
-        if is_comparison_query:
-            comparison_ans = self._check_date_comparison(q_lower, date_exprs, cutoff_date)
-            if comparison_ans:
-                return comparison_ans
-
-        requested_date = date_exprs[0][1] if date_exprs else None
-        if as_of is not None and requested_date and requested_date > as_of:
+        if cutoff_date and requested_date and requested_date > cutoff_date:
+            if as_of is None and "still open" in q_lower and re.search(r"hy-?vee", q_lower):
+                latest = self.ledger.get_target_snapshot(cutoff_date)
+                announcement = self._resolve_branches(q_lower, latest, [], cutoff_date, cutoff_date) if latest else None
+                if announcement and announcement.sources:
+                    return Answer(
+                        text="I cannot verify the requested date. The latest crawl says: " + announcement.sources[0].quote,
+                        sources=announcement.sources,
+                        confident=False,
+                    )
             return Answer(
                 text="The requested date is in the future relative to the snapshot cutoff date; information is not available.",
-                sources=[],
                 confident=False,
             )
 
-        # Evaluation date for 4-Clock eligibility (Clock 2 if specified and <= Clock 1, else Clock 1)
-        latest_bound = cutoff_date or "9999-99-99"
-        eval_date = requested_date if (requested_date and requested_date <= latest_bound) else latest_bound
+        eval_date = requested_date or cutoff_date
 
         # Resolve active snapshot at eval_date
         target_snap = self.ledger.get_target_snapshot(as_of=eval_date)
@@ -402,7 +365,6 @@ class AnswerResolver:
             or "launchpad" in q_lower
             or "holiday club" in q_lower
             or "hsa" in q_lower
-            or "0.35" in q_lower
         ):
             ans = self._resolve_accounts(q_lower, target_snap, eligible_facts)
             if ans:
@@ -419,6 +381,7 @@ class AnswerResolver:
             or "drive-up" in q_lower
             or "drive" in q_lower
             or "hours" in q_lower
+            or "physical offices" in q_lower
         ):
             ans = self._resolve_branches(q_lower, target_snap, eligible_facts, eval_date, eff_cutoff)
             if ans:
@@ -432,7 +395,7 @@ class AnswerResolver:
 
         # 13. Annual Statistics & Reports (VTO, Forbes)
         if "volunteer" in q_lower or "vto" in q_lower or "giving back" in q_lower or "forbes" in q_lower:
-            ans = self._resolve_statistics(q_lower, target_snap, eligible_facts)
+            ans = self._resolve_statistics(q_lower, target_snap, eligible_facts, eval_date)
             if ans:
                 return ans
 
@@ -553,81 +516,22 @@ class AnswerResolver:
 
     def _check_date_comparison(
         self,
-        q_lower: str,
+        question: str,
         date_exprs: list[tuple[str, str]],
         cutoff_date: Optional[str],
-    ) -> Optional[Answer]:
-        """Handle comparative questions between any two historical dates dynamically."""
-        if len(date_exprs) < 2:
-            return None
-        (lbl1, d1), (lbl2, d2) = date_exprs[0], date_exprs[1]
-
-        if cutoff_date and (d1 > cutoff_date or d2 > cutoff_date):
-            return Answer(
-                text="The requested comparison includes a date in the future relative to the snapshot cutoff date; information is not available.",
-                sources=[],
-                confident=False,
-            )
-
-        snap1 = self.ledger.get_target_snapshot(d1)
-        snap2 = self.ledger.get_target_snapshot(d2)
-        if not snap1 or not snap2:
-            return Answer(
-                text="Snapshot coverage is not available for both requested comparison dates.",
-                sources=[],
-                confident=False,
-            )
-
-        term = extract_requested_term_months(q_lower)
-        req_year = extract_requested_model_year(q_lower, date_exprs)
-
-        if re.search(r"\b(?:auto|vehicle|cars?|motorcycle)\b", q_lower):
-            cands1 = [
-                f for f in snap1.facts
-                if f.identity.entity == "auto_loan"
-                and f.identity.attribute == "apr"
-                and EligibilityEngine.is_eligible(f, target_date=d1, cutoff_date=cutoff_date or d1)
-                and (term is None or f.identity.term_months == term)
-                and (req_year is None or (f.identity.tier_interval and f.identity.tier_interval.contains(float(req_year))))
-            ]
-            cands2 = [
-                f for f in snap2.facts
-                if f.identity.entity == "auto_loan"
-                and f.identity.attribute == "apr"
-                and EligibilityEngine.is_eligible(f, target_date=d2, cutoff_date=cutoff_date or d2)
-                and (term is None or f.identity.term_months == term)
-                and (req_year is None or (f.identity.tier_interval and f.identity.tier_interval.contains(float(req_year))))
-            ]
-            f1 = EligibilityEngine.get_winning_fact(cands1, target_date=d1, cutoff_date=cutoff_date or d1, active_snapshot_id=snap1.snapshot_id)
-            f2 = EligibilityEngine.get_winning_fact(cands2, target_date=d2, cutoff_date=cutoff_date or d2, active_snapshot_id=snap2.snapshot_id)
-            if f1 and f2:
-                t_lbl = f"{f2.identity.term_months}-month " if f2.identity.term_months else ""
-                my_lbl1 = f" ({f1.identity.tier_interval.raw_label} models)" if f1.identity.tier_interval and f1.identity.tier_interval.raw_label else ""
-                my_lbl2 = f" ({f2.identity.tier_interval.raw_label} models)" if f2.identity.tier_interval and f2.identity.tier_interval.raw_label else ""
-                return Answer(
-                    text=f"The {t_lbl}auto loan APR was {f1.value_str}{my_lbl1} in {lbl1} ({snap1.taken_on}) and {f2.value_str}{my_lbl2} in {lbl2} ({snap2.taken_on}).",
-                    sources=[
-                        Source(url=f1.source_url, snapshot_id=f1.snapshot_id, quote=f1.raw_quote),
-                        Source(url=f2.source_url, snapshot_id=f2.snapshot_id, quote=f2.raw_quote),
-                    ],
-                    confident=True,
-                )
-            return Answer(
-                text="Matching auto loan rates were not found for both requested dates.",
-                sources=[],
-                confident=False,
-            )
-
-        # Generic two-date comparison for any other domain
-        ans1 = self.resolve(re.sub(re.escape(lbl2), "", q_lower, flags=re.I), as_of=d1)
-        ans2 = self.resolve(re.sub(re.escape(lbl1), "", q_lower, flags=re.I), as_of=d2)
-        if ans1.confident and ans2.confident:
-            return Answer(
-                text=f"As of {lbl1} ({snap1.taken_on}): {ans1.text} As of {lbl2} ({snap2.taken_on}): {ans2.text}",
-                sources=ans1.sources + ans2.sources,
-                confident=True,
-            )
-        return None
+    ) -> Answer:
+        """Resolve each comparison point with the same query and evidence ceiling."""
+        answers = []
+        for label, requested in date_exprs:
+            answer = self._resolve_at(question, cutoff_date, requested, date_exprs)
+            if not answer.confident:
+                return Answer(text="Matching evidence was not found for all requested dates.", confident=False)
+            answers.append((label, answer))
+        return Answer(
+            text=" ".join(f"As of {label}: {answer.text}" for label, answer in answers),
+            sources=[source for _, answer in answers for source in answer.sources],
+            confident=True,
+        )
 
     def _resolve_credit_cards(
         self,
@@ -635,6 +539,8 @@ class AnswerResolver:
         target_snap: SnapshotRecord,
         eligible_facts: list[ExtractedFact],
     ) -> Optional[Answer]:
+        if "intro" in q_lower and any(w in q_lower for w in ("how long", "duration", "window", "last")):
+            return self._balance_transfer_terms(q_lower, target_snap)
         card_facts = [
             f for f in eligible_facts
             if f.identity.entity == "credit_card"
@@ -656,7 +562,9 @@ class AnswerResolver:
         filtered = list(card_facts)
         if req_business_only:
             filtered = [f for f in filtered if f.identity.account_category == "business"]
-        elif req_personal_only or (req_platinum_only and "business" not in q_lower) or (req_rewards_only and "business" not in q_lower):
+        elif req_personal_only:
+            filtered = [f for f in filtered if f.identity.account_category == "personal"]
+        elif (req_platinum_only or req_rewards_only) and "business" not in q_lower:
             personal_subset = [f for f in filtered if f.identity.account_category == "personal"]
             if personal_subset:
                 filtered = personal_subset
@@ -676,34 +584,21 @@ class AnswerResolver:
         # Single card inquiry (e.g., Platinum Visa standard purchase APR or Rewards Visa APR)
         if req_platinum_only or req_rewards_only:
             std_facts = [f for f in filtered if not f.identity.is_intro]
-            intro_facts = [f for f in filtered if f.identity.is_intro]
-            std_facts.sort(
-                key=lambda x: (1 if x.typed_value and x.typed_value.is_range else 0, EligibilityEngine.rank_key(x)),
-                reverse=True,
-            )
-            if not std_facts:
+            f_std = EligibilityEngine.choose(std_facts)
+            if not f_std:
                 return Answer(
-                    text="No standard APR was found for the requested credit card.",
+                    text="No unambiguous standard APR was found for the requested credit card.",
                     sources=[],
                     confident=False,
                 )
-            f_std = std_facts[0]
             card_title = format_product_display_name(f_std.identity.product_name, "credit_card")
             range_note = ""
             if f_std.typed_value and f_std.typed_value.is_range and f_std.typed_value.high is not None:
                 range_note = f" (range up to {f_std.typed_value.high:.2f}%)"
 
-            intro_note = ""
             sources = [Source(url=f_std.source_url, snapshot_id=f_std.snapshot_id, quote=f_std.raw_quote)]
-            if intro_facts:
-                f_intro = intro_facts[0]
-                intro_note = f"; the {f_intro.value_str} APR is an introductory rate"
-                if f_std.footnote_text and "90 days" in f_std.footnote_text.lower():
-                    intro_note += " valid for the first 90 days"
-                sources.append(Source(url=f_intro.source_url, snapshot_id=f_intro.snapshot_id, quote=f_intro.raw_quote))
-
             return Answer(
-                text=f"The standard purchase APR for the Dupaco {card_title} is a variable rate of {f_std.value_str}{range_note}{intro_note}.",
+                text=f"The standard purchase APR for the Dupaco {card_title} is a variable rate of {f_std.value_str}{range_note}.",
                 sources=sources,
                 confident=True,
             )
@@ -726,33 +621,29 @@ class AnswerResolver:
         sources: list[Source] = []
         seen_quotes: set[tuple[str, str]] = set()
 
-        for idx, ((cat, pname), g_facts) in enumerate(sorted_groups, start=1):
+        for (cat, pname), g_facts in sorted_groups:
             std_f_list = [f for f in g_facts if not f.identity.is_intro]
-            intro_f_list = [f for f in g_facts if f.identity.is_intro]
-            std_f_list.sort(
-                key=lambda x: (1 if x.typed_value and x.typed_value.is_range else 0, EligibilityEngine.rank_key(x)),
-                reverse=True,
-            )
-            best_f = std_f_list[0] if std_f_list else g_facts[0]
+            best_f = EligibilityEngine.choose(std_f_list)
+            if not best_f:
+                continue
             disp_name = format_product_display_name(pname, "credit_card")
             if cat == "business" and "business" not in disp_name.lower():
                 disp_name = f"Business {disp_name}"
 
-            intro_clause = ""
-            if intro_f_list:
-                f_in = intro_f_list[0]
-                if best_f.footnote_text and "90 days" in best_f.footnote_text.lower():
-                    intro_clause = f" (with a {f_in.value_str} introductory balance-transfer APR for 6 months on transfers within 90 days)"
-                else:
-                    intro_clause = f" (with a {f_in.value_str} introductory APR)"
-
-            card_entries.append(f"{idx}. {disp_name}: {best_f.value_str} variable APR{intro_clause}.")
-            for sf in [best_f] + [f for f in std_f_list if "credit-cards" in f.source_url and f.snapshot_id == target_snap.snapshot_id]:
+            card_entries.append(f"{len(card_entries) + 1}. {disp_name}: {best_f.value_str} variable APR.")
+            corroboration = sorted(
+                (f for f in std_f_list if "credit-cards" in f.source_url and f.typed_value and best_f.typed_value
+                 and f.typed_value.equals(best_f.typed_value)),
+                key=lambda f: (f.source_url, f.raw_quote),
+            )
+            for sf in [best_f, *corroboration]:
                 qk = (sf.source_url, sf.raw_quote)
                 if qk not in seen_quotes:
                     seen_quotes.add(qk)
                     sources.append(Source(url=sf.source_url, snapshot_id=sf.snapshot_id, quote=sf.raw_quote))
 
+        if not card_entries:
+            return Answer(text="No unambiguous standard credit card APRs were found.", confident=False)
         count_words = {1: "one", 2: "two", 3: "three", 4: "four", 5: "five", 6: "six"}
         n_cards = len(card_entries)
         c_word = count_words.get(n_cards, str(n_cards))
@@ -764,6 +655,50 @@ class AnswerResolver:
             confident=True,
         )
 
+    def _balance_transfer_terms(self, question: str, snapshot: SnapshotRecord) -> Answer:
+        product = next((p for p in ("platinum visa", "rewards visa") if p in question), None)
+        if not product:
+            return Answer(text="Which credit card are you asking about?", confident=False)
+        amounts = r"(?:\d+|" + "|".join(NUMBER_WORDS) + ")"
+        duration_re = re.compile(rf"\b(?:for|lasts?|expires)\s+({amounts})\s+(months?)\b", re.I)
+        window_re = re.compile(rf"\b(?:within|(?:during|in) the first)\s+({amounts})\s+(days?)\b", re.I)
+        for page in sorted(snapshot.pages.values(), key=lambda p: ("/credit-cards" not in p.url, p.url)):
+            section = ""
+            duration = window = None
+            sources = []
+            for line in page.markdown.splitlines():
+                stripped = line.strip()
+                if stripped.startswith("#"):
+                    section = stripped.lstrip("# ").lower()
+                    duration = window = None
+                    sources = []
+                    continue
+                lower = stripped.lower()
+                if product not in lower and product not in section:
+                    continue
+                if ("business" in question) != ("business" in (lower + " " + section + " " + page.url)):
+                    continue
+                d_match = duration_re.search(stripped) if re.search(r"intro|transfer|expires", lower) else None
+                w_match = window_re.search(stripped) if "transfer" in lower else None
+                if d_match or w_match:
+                    source = Source(url=page.url, snapshot_id=snapshot.snapshot_id, quote=stripped)
+                    if source not in sources:
+                        sources.append(source)
+                if d_match:
+                    duration = d_match.groups()
+                if w_match:
+                    window = w_match.groups()
+                if duration and window:
+                    d_number, d_unit = duration
+                    w_number, w_unit = window
+                    d_number = NUMBER_WORDS.get(d_number.lower(), d_number)
+                    w_number = NUMBER_WORDS.get(w_number.lower(), w_number)
+                    return Answer(
+                        text=f"The introductory balance-transfer APR lasts {d_number} {d_unit}. Transfers must post within {w_number} {w_unit}.",
+                        sources=sources,
+                    )
+        return Answer(text="The requested introductory balance-transfer terms are not published in the available snapshot.", confident=False)
+
     def _resolve_certificate(
         self,
         q_lower: str,
@@ -772,27 +707,18 @@ class AnswerResolver:
     ) -> Optional[Answer]:
         # Direct link inquiry
         if "link" in q_lower or "url" in q_lower or "website" in q_lower or "webpage" in q_lower:
-            cand_pages = sorted(
-                [p for u, p in target_snap.pages.items() if "savings-account" in u.lower() or ("/rates" in u.lower() and "certificate" in p.markdown.lower())],
-                key=lambda p: (
-                    0 if "/personal/savings-account" in p.url.lower() and "business" not in q_lower else (1 if "/rates" in p.url.lower() else 2),
-                    p.url,
-                ),
-            )
-            cd_page = cand_pages[0] if cand_pages else None
-            if cd_page:
-                link_url = "https://www.dupaco.com/personal/savings-account#rates" if "/personal/savings-account" in cd_page.url.lower() else cd_page.url
-                q_line = find_verbatim_line(cd_page.markdown, r"certificate") or cd_page.title
+            category = "business" if "business" in q_lower else "personal"
+            rate_rows = [f for f in eligible_facts if f.identity.entity == "certificate"
+                         and f.identity.attribute == "apy" and f.identity.account_category == category]
+            if rate_rows:
+                evidence = min(rate_rows, key=lambda f: (
+                    "/savings-account" not in f.source_url, -f.authority_score, f.source_url, f.raw_quote,
+                ))
                 return Answer(
-                    text=f"You can view Dupaco's CD / certificate rates at {link_url}.",
-                    sources=[Source(url=link_url, snapshot_id=target_snap.snapshot_id, quote=q_line)],
-                    confident=True,
+                    text=f"You can view the certificate rates at {evidence.source_url}.",
+                    sources=[Source(url=evidence.source_url, snapshot_id=evidence.snapshot_id, quote=evidence.raw_quote)],
                 )
-            return Answer(
-                text="No certificate rates page link was found in the available snapshot.",
-                sources=[],
-                confident=False,
-            )
+            return Answer(text="No certificate rates page link was found in the available snapshot.", confident=False)
 
         req_dividend = "dividend" in q_lower and "apy" not in q_lower
         target_attr = "dividend_rate" if req_dividend else "apy"
@@ -804,13 +730,15 @@ class AnswerResolver:
             and f.identity.attribute == target_attr
             and f.identity.term_months is not None
         ]
-        # Filter by account_category (default personal unless business/ira asked)
-        if "business" in q_lower:
-            cert_facts = [f for f in cert_facts if f.identity.account_category == "business"]
+        if "traditional" in q_lower:
+            categories = {"traditional_ira"}
+        elif "roth" in q_lower:
+            categories = {"roth_ira"}
+        elif re.search(r"\bira\b", q_lower):
+            categories = {"ira", "traditional_ira", "roth_ira"}
         else:
-            personal_certs = [f for f in cert_facts if f.identity.account_category == "personal"]
-            if personal_certs:
-                cert_facts = personal_certs
+            categories = {"business" if "business" in q_lower else "personal"}
+        cert_facts = [f for f in cert_facts if f.identity.account_category in categories]
 
         if not cert_facts:
             return Answer(
@@ -829,7 +757,10 @@ class AnswerResolver:
                 if (
                     mf.identity.term_months == f_cert.identity.term_months
                     and mf.identity.is_jumbo == f_cert.identity.is_jumbo
+                    and mf.identity.account_category == f_cert.identity.account_category
+                    and mf.identity.is_special == f_cert.identity.is_special
                     and mf.source_url == f_cert.source_url
+                    and mf.raw_quote == f_cert.raw_quote
                 ):
                     return f" ({mf.value_str} minimum)"
             return ""
@@ -837,16 +768,21 @@ class AnswerResolver:
         term = extract_requested_term_months(q_lower)
         req_jumbo_only = "jumbo" in q_lower and "regular" not in q_lower
         req_regular_only = ("regular" in q_lower or "standard" in q_lower) and "jumbo" not in q_lower
+        if re.search(r"\bspecial\b", q_lower):
+            cert_facts = [f for f in cert_facts if f.identity.is_special]
+        if term is not None:
+            cert_facts = [f for f in cert_facts if f.identity.term_months == term]
 
         # Full schedule / general rates inquiry when no specific term is requested
-        if "all" in q_lower or term is None:
-            grouped: dict[tuple[int, bool, bool], list[ExtractedFact]] = defaultdict(list)
+        if term is None or len({f.identity.account_category for f in cert_facts}) > 1:
+            grouped: dict[tuple[int, bool, bool, str], list[ExtractedFact]] = defaultdict(list)
             for f in cert_facts:
                 if req_jumbo_only and not f.identity.is_jumbo:
                     continue
                 if req_regular_only and f.identity.is_jumbo:
                     continue
-                grouped[(f.identity.term_months or 0, f.identity.is_special, f.identity.is_jumbo)].append(f)
+                grouped[(f.identity.term_months or 0, f.identity.is_special, f.identity.is_jumbo,
+                         f.identity.account_category)].append(f)
 
             if not grouped:
                 return Answer(
@@ -858,16 +794,20 @@ class AnswerResolver:
             lines: list[str] = []
             sources: list[Source] = []
             seen_q: set[tuple[str, str]] = set()
-            for (t_m, is_sp, is_jb), g_list in sorted(grouped.items(), key=lambda x: x[0]):
-                g_list.sort(key=EligibilityEngine.rank_key, reverse=True)
-                bf = g_list[0]
+            for (t_m, is_sp, is_jb, category), g_list in sorted(grouped.items()):
+                bf = EligibilityEngine.choose(g_list)
+                if not bf:
+                    continue
                 spec_lbl = " Jumbo Special" if is_jb and is_sp else (" Jumbo" if is_jb else (" Special" if is_sp else ""))
-                lines.append(f"{t_m}-Month{spec_lbl}: {bf.value_str} {metric_label}")
+                account = category.replace("_ira", " IRA").title() + " " if category.endswith("_ira") else ""
+                lines.append(f"{account}{t_m}-Month{spec_lbl}: {bf.value_str} {metric_label}")
                 qk = (bf.source_url, bf.raw_quote)
                 if qk not in seen_q:
                     seen_q.add(qk)
                     sources.append(Source(url=bf.source_url, snapshot_id=bf.snapshot_id, quote=bf.raw_quote))
 
+            if not lines:
+                return Answer(text="The published certificate rates disagree.", confident=False)
             return Answer(
                 text=f"Dupaco's Certificate {metric_label}s are: " + ", ".join(lines) + ".",
                 sources=sources,
@@ -875,18 +815,22 @@ class AnswerResolver:
             )
 
         # Specific term requested: strict term match required
-        term_cands = [f for f in cert_facts if f.identity.term_months == term]
+        term_cands = cert_facts
         if not term_cands:
             return Answer(
-                text=f"Dupaco does not offer a {term}-month certificate; this term is not listed in the available snapshot.",
+                text="The requested certificate term and qualifiers are not listed in the available snapshot.",
                 sources=[],
                 confident=False,
             )
 
         reg_cands = [f for f in term_cands if not f.identity.is_jumbo]
         jumbo_cands = [f for f in term_cands if f.identity.is_jumbo]
-        reg_cands.sort(key=EligibilityEngine.rank_key, reverse=True)
-        jumbo_cands.sort(key=EligibilityEngine.rank_key, reverse=True)
+        regular = EligibilityEngine.choose(reg_cands)
+        jumbo = EligibilityEngine.choose(jumbo_cands)
+        if not regular and not jumbo or (req_regular_only and reg_cands and not regular) or (req_jumbo_only and jumbo_cands and not jumbo):
+            return Answer(text="The published certificate rates disagree.", confident=False)
+        reg_cands = [regular] if regular else []
+        jumbo_cands = [jumbo] if jumbo else []
 
         if req_jumbo_only:
             if not jumbo_cands:
@@ -897,6 +841,8 @@ class AnswerResolver:
                 )
             f_j = jumbo_cands[0]
             sp_lbl = "Fixed Jumbo Certificate Special" if f_j.identity.is_special else "Jumbo Certificate"
+            if f_j.identity.account_category.endswith("_ira"):
+                sp_lbl = f"{f_j.identity.account_category.replace('_ira', '').title()} IRA {sp_lbl}"
             min_note = _get_min_note(f_j)
             return Answer(
                 text=f"The {term}-Month {sp_lbl} pays {f_j.value_str} {metric_label}{min_note}.",
@@ -981,7 +927,7 @@ class AnswerResolver:
             candidates = [f for f in candidates if f.identity.term_months == term]
             if not candidates:
                 return Answer(
-                    text=f"No {term}-month auto loan rate is published in the available snapshot.",
+                    text="No auto loan rate is published for the requested term.",
                     sources=[],
                     confident=False,
                 )
@@ -1044,16 +990,15 @@ class AnswerResolver:
         if "heloc" in q_lower or ("home equity" in q_lower and "line" in q_lower):
             heloc_facts = [
                 f for f in eligible_facts
-                if f.identity.entity == "heloc" and f.identity.attribute == "apr"
+                if f.identity.entity == "heloc" and f.identity.attribute == "apr" and not f.identity.is_intro
             ]
-            if not heloc_facts:
+            f_h = EligibilityEngine.choose(heloc_facts)
+            if not f_h:
                 return Answer(
                     text="No Home Equity Line of Credit (HELOC) rates are published in the available snapshot.",
                     sources=[],
                     confident=False,
                 )
-            heloc_facts.sort(key=EligibilityEngine.rank_key, reverse=True)
-            f_h = heloc_facts[0]
             return Answer(
                 text=f"The standard Home Equity Line of Credit (HELOC) APR is {f_h.value_str}.",
                 sources=[Source(url=f_h.source_url, snapshot_id=f_h.snapshot_id, quote=f_h.raw_quote)],
@@ -1083,9 +1028,14 @@ class AnswerResolver:
                     sources=[],
                     confident=False,
                 )
-            he_facts.sort(key=lambda x: (EligibilityEngine.rank_key(x), -(x.identity.term_months or 999)), reverse=True)
-            if term is not None or len({f.identity.term_months for f in he_facts}) == 1:
-                best_he = he_facts[0]
+            by_term: dict[int, list[ExtractedFact]] = defaultdict(list)
+            for fact in he_facts:
+                by_term[fact.identity.term_months or 0].append(fact)
+            winners = {tm: winner for tm, facts in sorted(by_term.items()) if (winner := EligibilityEngine.choose(facts))}
+            if not winners:
+                return Answer(text=f"The published {label_name} rates disagree.", confident=False)
+            if len(by_term) == 1:
+                best_he = next(iter(winners.values()))
                 t_lbl = f"{best_he.identity.term_months}-month " if best_he.identity.term_months else ""
                 return Answer(
                     text=f"The {t_lbl}{label_name} APR is as low as {best_he.value_str}.",
@@ -1093,13 +1043,9 @@ class AnswerResolver:
                     confident=True,
                 )
             # Multiple terms available: report each term dynamically
-            by_term: dict[int, ExtractedFact] = {}
-            for f in sorted(he_facts, key=lambda x: (x.identity.term_months or 0, -EligibilityEngine.rank_key(x)[0])):
-                tm = f.identity.term_months or 0
-                if tm not in by_term:
-                    by_term[tm] = f
-            parts = [f"{tm}-month: {f.value_str} APR" for tm, f in sorted(by_term.items())]
-            srcs = [Source(url=f.source_url, snapshot_id=f.snapshot_id, quote=f.raw_quote) for f in by_term.values()]
+            parts = [f"{tm}-month: {f.value_str} APR" if tm else f"{f.value_str} APR (term unspecified)"
+                     for tm, f in winners.items()]
+            srcs = [Source(url=f.source_url, snapshot_id=f.snapshot_id, quote=f.raw_quote) for f in winners.values()]
             return Answer(
                 text=f"{label_name} rates are: " + ", ".join(parts) + ".",
                 sources=srcs,
@@ -1145,18 +1091,19 @@ class AnswerResolver:
                 )
 
         # Dynamic maximum loan ceiling check from actual candidate facts
-        all_ceilings = sorted({
-            f.identity.tier_interval.high for f in candidates
-            if f.identity.tier_interval and f.identity.tier_interval.high is not None
-        })
+        tiers = [f.identity.tier_interval for f in candidates if f.identity.tier_interval]
+        all_ceilings = [tier.high for tier in tiers if tier.high is not None]
         if req_amount is not None:
-            if all_ceilings:
+            if all_ceilings and all(tier.high is not None for tier in tiers):
                 max_pub_ceiling = max(all_ceilings)
                 if req_amount > max_pub_ceiling:
-                    cap_str = f"${max_pub_ceiling:,.0f}" if max_pub_ceiling.is_integer() else f"${max_pub_ceiling:,.2f}"
+                    cap = min(
+                        (f for f in candidates if f.identity.tier_interval and f.identity.tier_interval.high == max_pub_ceiling),
+                        key=lambda f: (f.source_url, f.raw_quote),
+                    )
                     return Answer(
-                        text=f"Conforming mortgage loan tables published on the website cap at {cap_str}; rates for higher loan amounts are not published.",
-                        sources=[],
+                        text="The requested amount is above the maximum published for this mortgage tier.",
+                        sources=[Source(url=cap.source_url, snapshot_id=cap.snapshot_id, quote=cap.raw_quote)],
                         confident=False,
                     )
             candidates = [
@@ -1165,18 +1112,34 @@ class AnswerResolver:
             ]
             if not candidates:
                 return Answer(
-                    text=f"No mortgage rate tier matching ${req_amount:,.0f} was found in the available snapshot.",
+                    text="No mortgage rate tier matches the requested amount.",
                     sources=[],
                     confident=False,
                 )
 
-        # Helper to prefer authoritative /home-loans and purchase (when tx_type not explicitly requested)
-        def _mort_sort_key(f: ExtractedFact) -> tuple:
-            return (
-                1 if "/home-loans" in f.source_url else 0,
-                1 if (not tx_type and f.identity.transaction_type == "purchase") else 0,
-                EligibilityEngine.rank_key(f),
-            )
+        if not tx_type:
+            purchase = [f for f in candidates if f.identity.transaction_type == "purchase"]
+            if purchase:
+                candidates = purchase
+
+        def mortgage_rate(facts, attribute, ceiling=None):
+            return EligibilityEngine.choose([
+                f for f in facts if f.identity.attribute == attribute
+                and (ceiling is None or (f.identity.tier_interval and f.identity.tier_interval.high == ceiling))
+            ])
+
+        def mortgage_sources(*facts):
+            supporting = [f for f in facts if f]
+            for fact in tuple(supporting):
+                supporting.extend(sorted(
+                    (f for f in candidates if "/home-loans" in f.source_url and f.identity == fact.identity
+                     and f.typed_value and fact.typed_value and f.typed_value.equals(fact.typed_value)),
+                    key=lambda f: (f.source_url, f.raw_quote),
+                ))
+            return [Source(url=url, snapshot_id=snapshot, quote=quote)
+                    for url, snapshot, quote in dict.fromkeys(
+                        (f.source_url, f.snapshot_id, f.raw_quote) for f in supporting
+                    )]
 
         # Specific amount or specific metric/tx_type inquiry
         if req_amount is not None or tx_type or req_apr_only or (term is not None and term != 360 and req_interest_rate):
@@ -1193,45 +1156,58 @@ class AnswerResolver:
                     sources=[],
                     confident=False,
                 )
-            metric_cands.sort(key=_mort_sort_key, reverse=True)
-            best_f = metric_cands[0]
-            # Also check if paired interest_rate / apr exists on the same row
-            paired_ir = next((f for f in candidates if f.raw_quote == best_f.raw_quote and f.identity.attribute == "interest_rate"), None)
-            paired_apr = next((f for f in candidates if f.raw_quote == best_f.raw_quote and f.identity.attribute == "apr"), None)
+            if len({f.identity.term_months for f in metric_cands}) > 1:
+                return Answer(text="Which mortgage term are you asking about?", confident=False)
+            if req_amount is None:
+                ceilings = [f.identity.tier_interval.high for f in metric_cands
+                            if f.identity.tier_interval and f.identity.tier_interval.high is not None]
+                if ceilings:
+                    first_ceiling = min(ceilings)
+                    metric_cands = [f for f in metric_cands if f.identity.tier_interval
+                                    and f.identity.tier_interval.high == first_ceiling]
+            best_f = EligibilityEngine.choose(metric_cands)
+            if not best_f:
+                return Answer(text="The published mortgage rates disagree for the requested tier.", confident=False)
+            same_tier = [f for f in candidates if f.identity.term_months == best_f.identity.term_months
+                         and f.identity.transaction_type == best_f.identity.transaction_type
+                         and f.identity.tier_interval == best_f.identity.tier_interval]
+            paired_ir = mortgage_rate(same_tier, "interest_rate")
+            paired_apr = mortgage_rate(same_tier, "apr")
 
             tx_label = f"{best_f.identity.transaction_type.capitalize()} " if best_f.identity.transaction_type else ""
-            t_label = f"{best_f.identity.term_months // 12}-Year Fixed " if best_f.identity.term_months else ""
+            months = best_f.identity.term_months
+            t_label = (f"{months // 12}-Year Fixed " if months % 12 == 0 else f"{months}-Month Fixed ") if months else ""
             tier_lbl = f" ({best_f.identity.tier_interval.raw_label})" if best_f.identity.tier_interval and best_f.identity.tier_interval.raw_label else ""
 
             if req_interest_rate or req_apr_only or not (paired_ir and paired_apr):
                 metric_label = "interest rate" if best_f.identity.attribute == "interest_rate" else "APR"
                 return Answer(
                     text=f"The {tx_label}{t_label}Conventional mortgage {metric_label}{tier_lbl} is {best_f.value_str}.",
-                    sources=[Source(url=best_f.source_url, snapshot_id=best_f.snapshot_id, quote=best_f.raw_quote)],
+                    sources=mortgage_sources(best_f),
                     confident=True,
                 )
             return Answer(
                 text=f"The {tx_label}{t_label}Conventional mortgage{tier_lbl} is {paired_ir.value_str} interest rate / {paired_apr.value_str} APR.",
-                sources=[Source(url=best_f.source_url, snapshot_id=best_f.snapshot_id, quote=best_f.raw_quote)],
+                sources=mortgage_sources(paired_ir, paired_apr),
                 confident=True,
             )
 
         # Broad mortgage inquiry (no specific amount requested): build summary strictly from actual rows in candidates
-        candidates.sort(key=_mort_sort_key, reverse=True)
-
         # If specifically 30-year ("30-year" / "30 year") broad inquiry
         if term == 360:
             m30 = [f for f in candidates if f.identity.term_months == 360]
             c30 = sorted({f.identity.tier_interval.high for f in m30 if f.identity.tier_interval and f.identity.tier_interval.high is not None})
             if c30:
                 low_c, high_c = c30[0], c30[-1]
-                r_low = next((f for f in m30 if f.identity.attribute == "interest_rate" and f.identity.tier_interval and f.identity.tier_interval.high == low_c), None)
-                a_low = next((f for f in m30 if f.identity.attribute == "apr" and f.identity.tier_interval and f.identity.tier_interval.high == low_c), None)
-                r_high = next((f for f in m30 if f.identity.attribute == "interest_rate" and f.identity.tier_interval and f.identity.tier_interval.high == high_c), None)
-                a_high = next((f for f in m30 if f.identity.attribute == "apr" and f.identity.tier_interval and f.identity.tier_interval.high == high_c), None)
-                src_f = r_low or a_low or m30[0]
+                r_low = mortgage_rate(m30, "interest_rate", low_c)
+                a_low = mortgage_rate(m30, "apr", low_c)
+                r_high = mortgage_rate(m30, "interest_rate", high_c)
+                a_high = mortgage_rate(m30, "apr", high_c)
+                src_f = r_low or a_low
+                if not src_f:
+                    return Answer(text="The published mortgage rates disagree for the requested tier.", confident=False)
                 eff_str = f", per the rate generation effective {src_f.effective_date}." if src_f.effective_date else "."
-                low_lbl = "$100k" if low_c == 100000.0 else f"${low_c:,.0f}"
+                low_lbl = f"${low_c:,.0f}"
                 high_lbl = f"${high_c:,.0f}"
                 if low_c == high_c or not (r_high and a_high):
                     r1_s = f"{r_low.value_str} rate" if r_low else ""
@@ -1239,15 +1215,12 @@ class AnswerResolver:
                     sep = " / " if (r1_s and a1_s) else ""
                     return Answer(
                         text=f"For 30-year loans up to {low_lbl}: {r1_s}{sep}{a1_s}{eff_str}",
-                        sources=[Source(url=src_f.source_url, snapshot_id=src_f.snapshot_id, quote=src_f.raw_quote)],
+                        sources=mortgage_sources(r_low, a_low),
                         confident=True,
                     )
-                srcs = [Source(url=src_f.source_url, snapshot_id=src_f.snapshot_id, quote=src_f.raw_quote)]
-                if r_high and r_high.raw_quote != src_f.raw_quote:
-                    srcs.append(Source(url=r_high.source_url, snapshot_id=r_high.snapshot_id, quote=r_high.raw_quote))
                 return Answer(
                     text=f"About {r_low.value_str if r_low else ''} rate / {a_low.value_str if a_low else ''} APR for loans up to {low_lbl}, up to {r_high.value_str} rate / {a_high.value_str} APR (loans up to {high_lbl}){eff_str}",
-                    sources=srcs,
+                    sources=mortgage_sources(r_low, a_low, r_high, a_high),
                     confident=True,
                 )
 
@@ -1265,9 +1238,8 @@ class AnswerResolver:
                 target_c = tm_ceils[0] if tm_ceils else None
                 if lead_ceiling is None and target_c is not None:
                     lead_ceiling = target_c
-                r_f = next((f for f in tm_facts if f.identity.attribute == "interest_rate" and (target_c is None or (f.identity.tier_interval and f.identity.tier_interval.high == target_c))), None)
-                a_f = next((f for f in tm_facts if f.identity.attribute == "apr" and (target_c is None or (f.identity.tier_interval and f.identity.tier_interval.high == target_c))), None)
-                rep_f = r_f or a_f or tm_facts[0]
+                r_f = mortgage_rate(tm_facts, "interest_rate", target_c)
+                a_f = mortgage_rate(tm_facts, "apr", target_c)
                 yr_str = f"{tm // 12}-year" if tm % 12 == 0 else f"{tm}-month"
                 if r_f and a_f:
                     summary_parts.append(f"{yr_str} {r_f.value_str} interest rate / {a_f.value_str} APR")
@@ -1275,15 +1247,16 @@ class AnswerResolver:
                     summary_parts.append(f"{yr_str} {a_f.value_str} APR")
                 elif r_f:
                     summary_parts.append(f"{yr_str} {r_f.value_str} interest rate")
-                qk = (rep_f.source_url, rep_f.raw_quote)
-                if qk not in seen_quotes:
-                    seen_quotes.add(qk)
-                    sources.append(Source(url=rep_f.source_url, snapshot_id=rep_f.snapshot_id, quote=rep_f.raw_quote))
+                for source in mortgage_sources(r_f, a_f):
+                    qk = (source.url, source.quote)
+                    if qk not in seen_quotes:
+                        seen_quotes.add(qk)
+                        sources.append(source)
 
             if summary_parts:
                 tier_prefix = ""
                 if lead_ceiling is not None:
-                    c_lbl = "$100k" if lead_ceiling == 100000.0 else f"${lead_ceiling:,.0f}"
+                    c_lbl = f"${lead_ceiling:,.0f}"
                     tier_prefix = f"For the {c_lbl} loan-amount tier: "
                 return Answer(
                     text=tier_prefix + ", and ".join(summary_parts) + ".",
@@ -1292,14 +1265,16 @@ class AnswerResolver:
                 )
 
         # Fallback single mortgage row without term_months
-        best_f = candidates[0]
-        paired_ir = next((f for f in candidates if f.raw_quote == best_f.raw_quote and f.identity.attribute == "interest_rate"), None)
-        paired_apr = next((f for f in candidates if f.raw_quote == best_f.raw_quote and f.identity.attribute == "apr"), None)
+        paired_ir = mortgage_rate(candidates, "interest_rate")
+        paired_apr = mortgage_rate(candidates, "apr")
+        best_f = paired_apr or paired_ir
+        if not best_f:
+            return Answer(text="No unambiguous mortgage rate was found.", confident=False)
         tier_lbl = f"For loans {best_f.identity.tier_interval.raw_label}: " if best_f.identity.tier_interval and best_f.identity.tier_interval.raw_label else ""
         if paired_ir and paired_apr:
             return Answer(
                 text=f"{tier_lbl}{paired_ir.value_str} interest rate / {paired_apr.value_str} APR.",
-                sources=[Source(url=best_f.source_url, snapshot_id=best_f.snapshot_id, quote=best_f.raw_quote)],
+                sources=mortgage_sources(paired_ir, paired_apr),
                 confident=True,
             )
         return Answer(
@@ -1417,25 +1392,27 @@ class AnswerResolver:
                     )
 
         # 2. Bright Savings
+        requested_metric = "dividend_rate" if "dividend" in q_lower and "apy" not in q_lower else "apy"
+        metric = "dividend rate" if requested_metric == "dividend_rate" else "APY"
         if "bright" in q_lower:
             bright_facts = [
                 f for f in eligible_facts
                 if f.identity.entity == "bright_savings" or f.identity.product_name == "bright_savings"
             ]
-            if not bright_facts:
+            winner = EligibilityEngine.choose([f for f in bright_facts if f.identity.attribute == requested_metric])
+            if not winner:
                 return Answer(
                     text="No Bright Savings rates are published in the available snapshot.",
                     sources=[],
                     confident=False,
                 )
-            bright_facts.sort(key=EligibilityEngine.rank_key, reverse=True)
-            apy_f = next((f for f in bright_facts if f.identity.attribute == "apy"), bright_facts[0])
-            div_f = next((f for f in bright_facts if f.identity.attribute == "dividend_rate" and f.source_url == apy_f.source_url), None)
-            div_str = f"{div_f.value_str} dividend rate and " if div_f else ""
-            eff_str = f" (rates effective {apy_f.effective_date})" if apy_f.effective_date else ""
+            dividend = EligibilityEngine.choose([f for f in bright_facts if f.identity.attribute == "dividend_rate"])
+            div_str = (f"{dividend.value_str} dividend rate and " if requested_metric == "apy" and "apy" not in q_lower
+                       and dividend and dividend.source_url == winner.source_url and dividend.raw_quote == winner.raw_quote else "")
+            eff_str = f" (rates effective {winner.effective_date})" if winner.effective_date else ""
             return Answer(
-                text=f"Bright Savings earns a {div_str}{apy_f.value_str} APY{eff_str}.",
-                sources=[Source(url=apy_f.source_url, snapshot_id=apy_f.snapshot_id, quote=apy_f.raw_quote)],
+                text=f"Bright Savings earns {div_str}{winner.value_str} {metric}{eff_str}.",
+                sources=[Source(url=winner.source_url, snapshot_id=winner.snapshot_id, quote=winner.raw_quote)],
                 confident=True,
             )
 
@@ -1469,47 +1446,47 @@ class AnswerResolver:
                 or ("analysis" in q_lower and "analysis" in p)
             ]
 
+            checking_facts = [f for f in checking_facts if f.identity.attribute == requested_metric
+                              and (not matched_prods or f.identity.product_name in matched_prods)]
             if req_amount is not None:
-                cands = [f for f in checking_facts if (not matched_prods or f.identity.product_name in matched_prods)]
-                cands = [f for f in cands if f.identity.tier_interval and f.identity.tier_interval.contains(req_amount)]
+                cands = [f for f in checking_facts if f.identity.tier_interval and f.identity.tier_interval.contains(req_amount)]
                 if not cands:
                     return Answer(
                         text=f"No checking rate tier matching ${req_amount:,.2f} was found in the available snapshot.",
                         sources=[],
                         confident=False,
                     )
-                cands.sort(key=EligibilityEngine.rank_key, reverse=True)
-                best_f = next((f for f in cands if f.identity.attribute == "apy"), cands[0])
+                best_f = EligibilityEngine.choose(cands)
+                if not best_f:
+                    return Answer(text="The published checking rates disagree for that tier.", confident=False)
                 p_disp = format_product_display_name(best_f.identity.product_name, "checking")
                 t_lbl = f" for balances {best_f.identity.tier_interval.raw_label}" if best_f.identity.tier_interval and best_f.identity.tier_interval.raw_label else ""
                 return Answer(
-                    text=f"{p_disp} pays {best_f.value_str} APY{t_lbl}.",
+                    text=f"{p_disp} pays {best_f.value_str} {metric}{t_lbl}.",
                     sources=[Source(url=best_f.source_url, snapshot_id=best_f.snapshot_id, quote=best_f.raw_quote)],
                     confident=True,
                 )
 
-            # Group checking APY facts by (product_name, tier_label) and pick highest-ranked per group
-            apy_facts = [f for f in checking_facts if f.identity.attribute == "apy"] or checking_facts
+            # Resolve each product and balance tier independently.
+            groups = defaultdict(list)
+            for fact in checking_facts:
+                groups[fact.identity].append(fact)
             prod_tiers: dict[str, list[ExtractedFact]] = defaultdict(list)
-            seen_pt: set[tuple[str, str]] = set()
-            for f in sorted(apy_facts, key=EligibilityEngine.rank_key, reverse=True):
-                pname = f.identity.product_name or "checking"
-                tlbl = f.identity.tier_interval.raw_label if f.identity.tier_interval and f.identity.tier_interval.raw_label else ""
-                if (pname, tlbl) not in seen_pt:
-                    seen_pt.add((pname, tlbl))
-                    prod_tiers[pname].append(f)
+            for identity, facts in groups.items():
+                if winner := EligibilityEngine.choose(facts):
+                    prod_tiers[identity.product_name or "checking"].append(winner)
 
             if not prod_tiers:
-                return None
+                return Answer(text=f"No unambiguous checking {metric} is published for the requested account.", confident=False)
 
             clauses: list[str] = []
             sources: list[Source] = []
             seen_q: set[tuple[str, str]] = set()
-            for pname, tfacts in prod_tiers.items():
+            for pname, tfacts in sorted(prod_tiers.items()):
                 p_disp = format_product_display_name(pname, "checking")
                 if len(tfacts) == 1 and not (tfacts[0].identity.tier_interval and tfacts[0].identity.tier_interval.raw_label):
                     bf = tfacts[0]
-                    clauses.append(f"{p_disp} offers {bf.value_str} APY")
+                    clauses.append(f"{p_disp} offers {bf.value_str} {metric}")
                     qk = (bf.source_url, bf.raw_quote)
                     if qk not in seen_q:
                         seen_q.add(qk)
@@ -1522,9 +1499,9 @@ class AnswerResolver:
                     other_parts = []
                     for of in tfacts_sorted[1:]:
                         olbl = of.identity.tier_interval.raw_label if of.identity.tier_interval and of.identity.tier_interval.raw_label else "other balances"
-                        other_parts.append(f"{of.value_str} APY on {olbl}")
+                        other_parts.append(f"{of.value_str} {metric} on {olbl}")
                     other_str = f" ({', '.join(other_parts)})" if other_parts else ""
-                    clauses.append(f"{p_disp} offers {lead_f.value_str} APY{lead_lbl}{other_str}")
+                    clauses.append(f"{p_disp} offers {lead_f.value_str} {metric}{lead_lbl}{other_str}")
                     for tf in tfacts_sorted:
                         qk = (tf.source_url, tf.raw_quote)
                         if qk not in seen_q:
@@ -1553,6 +1530,7 @@ class AnswerResolver:
             savings_facts = [f for f in savings_facts if f.identity.product_name == "launchpad_savings"]
         elif "holiday club" in q_lower:
             savings_facts = [f for f in savings_facts if f.identity.product_name == "holiday_club_savings"]
+        savings_facts = [f for f in savings_facts if f.identity.attribute == requested_metric]
 
         if not savings_facts:
             return Answer(
@@ -1573,31 +1551,29 @@ class AnswerResolver:
                     sources=[],
                     confident=False,
                 )
-            tier_matches.sort(key=EligibilityEngine.rank_key, reverse=True)
-            apy_f = next((f for f in tier_matches if f.identity.attribute == "apy"), tier_matches[0])
-            div_f = next((f for f in tier_matches if f.identity.attribute == "dividend_rate" and f.raw_quote == apy_f.raw_quote), None)
-            p_disp = format_product_display_name(apy_f.identity.product_name, apy_f.identity.entity)
-            t_lbl = apy_f.identity.tier_interval.raw_label if apy_f.identity.tier_interval and apy_f.identity.tier_interval.raw_label else f"${req_amount:,.2f}"
-            if div_f and apy_f.identity.attribute == "apy":
-                return Answer(
-                    text=f"For balances in the {t_lbl} tier, {p_disp} pays a {div_f.value_str} dividend rate and {apy_f.value_str} APY.",
-                    sources=[Source(url=apy_f.source_url, snapshot_id=apy_f.snapshot_id, quote=apy_f.raw_quote)],
-                    confident=True,
-                )
+            winner = EligibilityEngine.choose(tier_matches)
+            if not winner:
+                return Answer(text=f"No unambiguous savings {metric} was found for the requested tier.", confident=False)
+            p_disp = format_product_display_name(winner.identity.product_name, winner.identity.entity)
+            t_lbl = winner.identity.tier_interval.raw_label or f"${req_amount:,.2f}"
             return Answer(
-                text=f"For balances in the {t_lbl} tier, {p_disp} pays {apy_f.value_str} APY.",
-                sources=[Source(url=apy_f.source_url, snapshot_id=apy_f.snapshot_id, quote=apy_f.raw_quote)],
+                text=f"For balances in the {t_lbl} tier, {p_disp} pays {winner.value_str} {metric}.",
+                sources=[Source(url=winner.source_url, snapshot_id=winner.snapshot_id, quote=winner.raw_quote)],
                 confident=True,
             )
 
         # General Share Savings / Savings rate inquiry: report all tiers or top tier dynamically
-        apy_s_facts = [f for f in savings_facts if f.identity.attribute == "apy"] or savings_facts
-        apy_s_facts.sort(key=lambda x: (x.value_num or 0.0, EligibilityEngine.rank_key(x)), reverse=True)
-        top_f = apy_s_facts[0]
+        tiers = defaultdict(list)
+        for fact in savings_facts:
+            tiers[fact.identity].append(fact)
+        winners = [winner for facts in tiers.values() if (winner := EligibilityEngine.choose(facts))]
+        if not winners:
+            return Answer(text=f"No unambiguous savings {metric} is published for the requested account.", confident=False)
+        top_f = max(winners, key=lambda f: (f.value_num or 0.0, EligibilityEngine.rank_key(f), f.source_url, f.raw_quote))
         p_disp = format_product_display_name(top_f.identity.product_name, top_f.identity.entity)
         t_lbl = f" for balances of {top_f.identity.tier_interval.raw_label}" if top_f.identity.tier_interval and top_f.identity.tier_interval.raw_label else ""
         return Answer(
-            text=f"{p_disp} pays up to {top_f.value_str} APY{t_lbl}.",
+            text=f"{p_disp} pays up to {top_f.value_str} {metric}{t_lbl}.",
             sources=[Source(url=top_f.source_url, snapshot_id=top_f.snapshot_id, quote=top_f.raw_quote)],
             confident=True,
         )
@@ -1633,7 +1609,7 @@ class AnswerResolver:
             fee_label = "overdraft fee"
         elif "replacement" in q_lower or ("lost" in q_lower and "debit" in q_lower):
             req_attr = "replacement_fee"
-            fee_label = "lost debit card replacement fee"
+            fee_label = "credit card replacement fee" if "credit card" in q_lower or "visa" in q_lower else "lost debit card replacement fee"
         elif "statement" in q_lower:
             req_attr = "monthly_fee"
             fee_label = "paper statement fee"
@@ -1653,30 +1629,55 @@ class AnswerResolver:
                 and any(tok in f.identity.product_name or tok in f.identity.attribute for tok in q_tokens)
             ]
 
+        named_card = next((name for name in ("platinum", "rewards") if f"{name} visa" in q_lower), None)
+        card_requested = named_card or "credit card" in q_lower
+        if card_requested:
+            fee_facts = [f for f in fee_facts if f.identity.entity == "credit_card"]
+        elif req_attr == "replacement_fee":
+            fee_facts = [f for f in fee_facts if f.identity.entity == "debit_card"]
+        if named_card:
+            card_product = f"business_{named_card}" if "business" in q_lower else f"{named_card}_visa"
+            fee_facts = [f for f in fee_facts if f.identity.product_name == card_product]
         if fee_facts:
-            fee_facts.sort(key=EligibilityEngine.rank_key, reverse=True)
-            f_top = fee_facts[0]
+            winner = EligibilityEngine.choose(fee_facts)
+            if not winner:
+                return Answer(text=f"No current {fee_label} can be confirmed.", confident=False)
+            matching = [winner]
+            if named_card:
+                corroboration = next((
+                    f for f in sorted(fee_facts, key=lambda f: (f.source_url, f.raw_quote))
+                    if "/credit-cards" in f.source_url and f.value_str == winner.value_str
+                ), None)
+                if corroboration and corroboration not in matching:
+                    matching.append(corroboration)
+            conditions = winner.footnote_conditions
+            if not conditions:
+                label = winner.identity.attribute.removesuffix("_fee").replace("_", " ")
+                conditions = next((sentence for sentence in re.split(r"(?<=[.!?])\s+|[;\n]", winner.raw_quote)
+                                   if label in sentence.lower()), "")
+            qualified = re.search(r"\b(?:whichever|up to|at least|per item|per transaction|waived if|unless)\b", conditions, re.I)
+            text = f"The {fee_label} is {winner.value_str}."
+            if qualified:
+                text = f"The published {fee_label} disclosure reads “{conditions}”."
             return Answer(
-                text=f"The {fee_label} is {f_top.value_str}.",
-                sources=[Source(url=f_top.source_url, snapshot_id=f_top.snapshot_id, quote=f_top.raw_quote)],
-                confident=True,
+                text=text,
+                sources=[Source(url=f.source_url, snapshot_id=f.snapshot_id, quote=f.raw_quote) for f in matching],
             )
 
         # Last-known observation policy for omitted pages vs. retired fees on surviving pages:
         # Only fall back to an earlier snapshot if the source page URL itself disappeared from target_snap.pages.
         # If the source page still exists in target_snap.pages and no longer lists the fee, the fee was retired/removed.
-        if req_attr:
+        if req_attr == "replacement_fee" and not card_requested:
             for snap in reversed(self.ledger.chronological_snapshots):
                 if snap.taken_on < target_snap.taken_on:
                     older_fees = [
                         f for f in snap.facts
-                        if f.identity.attribute == req_attr
+                        if f.identity.attribute == req_attr and f.identity.entity == "debit_card"
                         and EligibilityEngine.is_eligible(f, target_date=eval_date, cutoff_date=cutoff_date)
                     ]
                     if older_fees:
-                        older_fees.sort(key=EligibilityEngine.rank_key, reverse=True)
-                        f_old = older_fees[0]
-                        if f_old.source_url not in target_snap.pages:
+                        f_old = EligibilityEngine.choose(older_fees)
+                        if f_old and f_old.source_url not in target_snap.pages:
                             return Answer(
                                 text=f"The {fee_label} is {f_old.value_str} (last published in snapshot {f_old.snapshot_id}).",
                                 sources=[Source(url=f_old.source_url, snapshot_id=f_old.snapshot_id, quote=f_old.raw_quote)],
@@ -1699,7 +1700,7 @@ class AnswerResolver:
         cutoff_date: str,
     ) -> Optional[Answer]:
         # 1. Branch count
-        if "how many branches" in q_lower or "number of branches" in q_lower or "how many locations" in q_lower or "branch count" in q_lower:
+        if "how many branches" in q_lower or "number of branches" in q_lower or "how many locations" in q_lower or "branch count" in q_lower or ("network" in q_lower and "physical offices" in q_lower):
             branch_facts = [
                 f for f in eligible_facts
                 if f.identity.attribute == "branch_count"
@@ -1781,8 +1782,16 @@ class AnswerResolver:
                     if m_close:
                         close_date_str = m_close.group(1)
                         q_line = find_verbatim_line(hyvee_page.markdown, re.escape(close_date_str)) or close_date_str
+                        scheduled = _resolve_raw_date_token(close_date_str, eval_date, None)
+                        status = f"The Hy-Vee branch was scheduled to close {close_date_str}."
+                        if "still open" in q_lower and scheduled and eval_date < scheduled:
+                            return Answer(
+                                text=f"I cannot verify whether the branch was open on that date. {status}",
+                                sources=[Source(url=hyvee_page.url, snapshot_id=target_snap.snapshot_id, quote=q_line)],
+                                confident=False,
+                            )
                         return Answer(
-                            text=f"No - the Hy-Vee branch was scheduled to close {close_date_str}.",
+                            text=status,
                             sources=[Source(url=hyvee_page.url, snapshot_id=target_snap.snapshot_id, quote=q_line)],
                             confident=True,
                         )
@@ -1792,25 +1801,41 @@ class AnswerResolver:
                 confident=False,
             )
 
-        # 4. Specific named branch schedule check (do not substitute generic lobby/drive-up hours for a specific branch)
-        named_city = next((c for c in KNOWN_BRANCH_CITIES if c in q_lower), None)
-        if named_city and any(k in q_lower for k in ("hours", "lobby", "drive", "open", "saturday", "sunday", "schedule", "weekend")):
-            day_kw = next((d for d in ("saturday", "sunday", "monday", "tuesday", "wednesday", "thursday", "friday") if d in q_lower), "")
-            for u, p in target_snap.pages.items():
-                if named_city in p.markdown.lower():
-                    pat = rf"{re.escape(named_city)}[^\n]*{day_kw}[^\n]*\b\d{{1,2}}(?::\d{{2}})?\s*(?:a\.?m\.?|p\.?m\.?)"
-                    q_line = find_verbatim_line(p.markdown, pat)
-                    if q_line:
-                        return Answer(
-                            text=f"Schedule for the {named_city.title()} branch: {q_line}",
-                            sources=[Source(url=u, snapshot_id=target_snap.snapshot_id, quote=q_line)],
-                            confident=True,
-                        )
-            return Answer(
-                text=f"The website does not publish an explicit {day_kw + ' ' if day_kw else ''}schedule for the {named_city.title()} branch.",
-                sources=[],
-                confident=False,
+        if any(k in q_lower for k in ("hours", "lobby", "drive", "open", "schedule")):
+            day = next((d for d in ("saturday", "sunday", "monday", "tuesday", "wednesday", "thursday", "friday") if d in q_lower), "")
+            known_name = next((n for n in KNOWN_BRANCH_CITIES if n in q_lower), None)
+            named_request = known_name or re.search(
+                r"\b(?:at|for|of)\s+(?:the\s+)?(?!all\b|each\b|every\b|any\b|most\b)[\w -]+?\s+branch\b",
+                q_lower,
             )
+            for page in sorted(target_snap.pages.values(), key=lambda p: p.url):
+                if not re.search(r"/(?:contact|locations?|branches)(?:/|$)", page.url):
+                    continue
+                # A schedule belongs only to the branch block that introduces it.
+                headings = list(re.finditer(r"(?im)^(?:#{1,6}\s+|\*\*)([^\n*]+?)\s+branch\b[^\n]*$", page.markdown))
+                for idx, heading in enumerate(headings):
+                    name = heading[1].strip().lower()
+                    if not re.search(rf"\b{re.escape(name)}\b", q_lower):
+                        continue
+                    named_request = True
+                    end = headings[idx + 1].start() if idx + 1 < len(headings) else len(page.markdown)
+                    block = page.markdown[heading.start():end]
+                    if "drive" in q_lower:
+                        schedule = re.search(r"(?im)^\s*(?:#+\s+|\*\*)?drive[- ]up(?: hours)?[^\n]*\n", block)
+                        if not schedule:
+                            continue
+                        block = block[schedule.end():]
+                    else:
+                        block = re.split(r"(?im)^\s*(?:#+\s+|\*\*)?drive[- ]up\b", block, maxsplit=1)[0]
+                    days = day or r"(?:mon|tue|wed|thu|fri|sat|sun)\w*"
+                    quote = find_verbatim_line(block, rf"\b{days}\b.*(?:\d+.*(?:a\.m\.|p\.m\.)|noon|closed)")
+                    if quote:
+                        return Answer(
+                            text=f"{heading[1].strip()} branch: {quote}",
+                            sources=[Source(url=page.url, snapshot_id=target_snap.snapshot_id, quote=quote)],
+                        )
+            if named_request:
+                return Answer(text="The requested branch schedule is not published in the available snapshot.", confident=False)
 
         # 5. General Lobby Hours (require explicit time schedule in page markdown)
         if "lobby" in q_lower:
@@ -1925,9 +1950,8 @@ class AnswerResolver:
             f for f in eligible_facts
             if f.identity.attribute == "routing_number"
         ]
-        if routing_facts:
-            routing_facts.sort(key=EligibilityEngine.rank_key, reverse=True)
-            f_r = routing_facts[0]
+        f_r = EligibilityEngine.choose(routing_facts)
+        if f_r:
             return Answer(
                 text=f"Dupaco's routing number is {f_r.value_str}.",
                 sources=[Source(url=f_r.source_url, snapshot_id=f_r.snapshot_id, quote=f_r.raw_quote)],
@@ -1944,6 +1968,7 @@ class AnswerResolver:
         q_lower: str,
         target_snap: SnapshotRecord,
         eligible_facts: list[ExtractedFact],
+        eval_date: str,
     ) -> Optional[Answer]:
         if "forbes" in q_lower:
             forbes_pages = sorted(
@@ -1973,84 +1998,84 @@ class AnswerResolver:
                 confident=False,
             )
 
-        if "volunteer" in q_lower or "vto" in q_lower or "giving back" in q_lower:
-            emp_facts = [f for f in eligible_facts if f.identity.attribute == "vto_employees"]
-            hrs_facts = [f for f in eligible_facts if f.identity.attribute == "vto_hours"]
-            if not emp_facts and not hrs_facts:
-                return Answer(
-                    text="No Volunteer Time Off (VTO) statistics are published in the available snapshot.",
-                    sources=[],
-                    confident=False,
-                )
-
-            m_yr = re.search(r"\b(20\d{2})\b", q_lower)
-            if m_yr:
-                req_yr = m_yr.group(1)
-                yr_emp = [f for f in emp_facts if f.identity.reporting_period == req_yr]
-                yr_hrs = [f for f in hrs_facts if f.identity.reporting_period == req_yr]
-                if not yr_emp and not yr_hrs:
-                    return Answer(
-                        text=f"No Volunteer Time Off (VTO) statistics for {req_yr} are published in the available snapshot.",
-                        sources=[],
-                        confident=False,
-                    )
-                f_e = yr_emp[0] if yr_emp else yr_hrs[0]
-                hrs_clause = f" across {yr_hrs[0].value_str} hours" if yr_hrs else ""
-                return Answer(
-                    text=f"In {req_yr}, {f_e.value_str} Dupaco employees used volunteer time off (VTO){hrs_clause}.",
-                    sources=[Source(url=f_e.source_url, snapshot_id=f_e.snapshot_id, quote=f_e.raw_quote)],
-                    confident=True,
-                )
-
-            # Unqualified VTO query: report all reporting periods present in eligible_facts
-            periods = sorted({f.identity.reporting_period for f in emp_facts if f.identity.reporting_period})
-            parts: list[str] = []
-            sources: list[Source] = []
-            seen_q: set[tuple[str, str]] = set()
-            for per in periods:
-                f_e = next((f for f in emp_facts if f.identity.reporting_period == per), None)
-                f_h = next((f for f in hrs_facts if f.identity.reporting_period == per), None)
-                if f_e:
-                    h_str = f" across {f_h.value_str} hours" if f_h else ""
-                    parts.append(f"In {per}, {f_e.value_str} employees used Volunteer Time Off (VTO){h_str}")
-                    qk = (f_e.source_url, f_e.raw_quote)
-                    if qk not in seen_q:
-                        seen_q.add(qk)
-                        sources.append(Source(url=f_e.source_url, snapshot_id=f_e.snapshot_id, quote=f_e.raw_quote))
-
-            if parts:
-                return Answer(
-                    text="; ".join(parts) + ".",
-                    sources=sources,
-                    confident=True,
-                )
+        if re.search(r"\b(?:volunteer\w*|vto|giving back)\b", q_lower):
+            wants_hours = "hours" in q_lower
+            asks_vto = bool(re.search(r"\bvto\b|volunteer time off", q_lower))
+            attribute = ("vto_hours" if asks_vto else "volunteer_hours") if wants_hours else "vto_employees"
+            facts = [f for f in eligible_facts if f.identity.attribute == attribute and f.identity.reporting_period]
+            relative = "last year" in q_lower or "previous year" in q_lower
+            explicit_year = re.search(r"\b(?:19|20)\d{2}\b", q_lower)
+            requested_year = str(int(eval_date[:4]) - 1) if relative else (explicit_year[0] if explicit_year else None)
+            years = sorted({f.identity.reporting_period for f in facts})
+            selected = [
+                winner for year in years if not requested_year or year == requested_year
+                if (winner := EligibilityEngine.choose([f for f in facts if f.identity.reporting_period == year]))
+            ]
+            missing_requested = not selected and requested_year is not None
+            if missing_requested and relative:
+                selected = [
+                    winner for year in years if year < requested_year
+                    if (winner := EligibilityEngine.choose([f for f in facts if f.identity.reporting_period == year]))
+                ][-2:]
+            if not selected:
+                return Answer(text="The requested volunteer statistic is not published in the available snapshot.", confident=False)
+            lines = []
+            if missing_requested:
+                lines.append(f"The requested statistic for {requested_year} is unpublished. Historical figures:")
+            metric = "VTO hours" if asks_vto else "volunteer hours"
+            for fact in selected:
+                year = fact.identity.reporting_period
+                if wants_hours:
+                    lines.append(f"In {year}, employees contributed {fact.value_str} {metric}.")
+                else:
+                    lines.append(f"In {year}, {fact.value_str} employees used Volunteer Time Off (VTO).")
+            return Answer(
+                text=" ".join(lines),
+                sources=[Source(url=f.source_url, snapshot_id=f.snapshot_id, quote=f.raw_quote) for f in selected],
+                confident=not missing_requested,
+            )
 
         return None
 
-    def _resolve_mobile_payments(self, q_lower: str, target_snap: SnapshotRecord) -> Optional[Answer]:
-        known_wallets = ("Apple Pay", "Google Pay", "Samsung Pay", "Garmin Pay", "Fitbit Pay")
-        for u, p in target_snap.pages.items():
-            md_l = p.markdown.lower()
-            if "mobile-payments" in u.lower() or "wallet" in md_l or any(w.lower() in md_l for w in known_wallets):
-                found = [w for w in known_wallets if w.lower() in md_l]
+    def _resolve_mobile_payments(self, q_lower: str, target_snap: SnapshotRecord) -> Answer:
+        wallets = ("Apple Pay", "Google Pay", "Samsung Pay", "Garmin Pay", "Fitbit Pay")
+        requested = [w for w in wallets if w.lower() in q_lower]
+        names = requested or wallets
+        supported = []
+        sources = []
+        pages = sorted(target_snap.pages.values(), key=lambda p: ("/mobile-payments" not in p.url, p.url))
+        for wallet in names:
+            found = None
+            for page in pages:
+                for line in page.markdown.splitlines():
+                    line = line.strip()
+                    if wallet.lower() not in line.lower() or line.startswith(("![", "[")):
+                        continue
+                    for clause in re.split(r"[.!?;]\s+|(?:,?\s+but\s+)", line):
+                        if wallet.lower() not in clause.lower():
+                            continue
+                        negated = re.search(r"\b(?:unavailable|unsupported|not (?:available|supported)|does not support|cannot use)\b", clause, re.I)
+                        positive = re.search(r"\b(?:support\w*|compatible|add|pay with|use|available|only)\b", clause, re.I)
+                        if negated or positive:
+                            found = (page, line, bool(negated))
+                            break
+                    if found:
+                        break
                 if found:
-                    q_line = find_verbatim_line(p.markdown, re.escape(found[0])) or found[0]
-                    if len(found) == 1:
-                        w_list_str = found[0]
-                    elif len(found) == 2:
-                        w_list_str = f"{found[0]} and {found[1]}"
-                    else:
-                        w_list_str = ", ".join(found[:-1]) + f", and {found[-1]}"
-                    return Answer(
-                        text=f"Yes - Dupaco cards can be added to mobile wallets including {w_list_str}.",
-                        sources=[Source(url=u, snapshot_id=target_snap.snapshot_id, quote=q_line)],
-                        confident=True,
-                    )
-        return Answer(
-            text="No mobile wallet payment information was found in the available snapshot.",
-            sources=[],
-            confident=False,
-        )
+                    break
+            if not found:
+                continue
+            page, line, unavailable = found
+            source = Source(url=page.url, snapshot_id=page.snapshot_id, quote=line)
+            if requested and unavailable:
+                return Answer(text=f"{wallet} is unavailable for these cards.", sources=[source])
+            if not unavailable:
+                supported.append(wallet)
+                if source not in sources:
+                    sources.append(source)
+        if supported:
+            return Answer(text="Supported mobile wallets include " + ", ".join(supported) + ".", sources=sources)
+        return Answer(text="No matching mobile wallet support was found in the available snapshot.", confident=False)
 
     def _resolve_membership(self, q_lower: str, target_snap: SnapshotRecord) -> Optional[Answer]:
         join_cands = sorted(
@@ -2066,8 +2091,8 @@ class AnswerResolver:
 
         if "online" in q_lower or "how" in q_lower or "link" in q_lower:
             for join_page in join_cands:
-                if "in person only" in join_page.markdown.lower() or "in-person only" in join_page.markdown.lower():
-                    q_line = find_verbatim_line(join_page.markdown, r"in[- ]person\s+only") or join_page.markdown.strip()
+                q_line = find_verbatim_line(join_page.markdown, r"(?:in[- ]person\s+only|only[^.\n]*in[- ]person)")
+                if q_line:
                     return Answer(
                         text=f"Online joining is not available: {q_line}",
                         sources=[Source(url=join_page.url, snapshot_id=target_snap.snapshot_id, quote=q_line)],
